@@ -1,0 +1,9 @@
+# The same loop with an accumulation: 1M iterations, nine bytecodes.
+def f(n):
+    var i = 0
+    var t = 0
+    while i < n:
+        t = t + i
+        i = i + 1
+    return t
+f(1000000)

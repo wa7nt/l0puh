@@ -1,0 +1,19 @@
+{
+  "name": "l0puh",
+  "version": "0.2.0",
+  "description": "l0puh — a small language with Python-like modules and Go-like concurrency",
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "bin": {
+    "l0p": "./src/cli/main.ts"
+  },
+  "scripts": {
+    "test": "node --test \"test/*.test.ts\"",
+    "repl": "node src/cli/repl.ts",
+    "parse": "node src/cli/main.ts parse",
+    "lex": "node src/cli/main.ts lex"
+  },
+  "private": true
+}

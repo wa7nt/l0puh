@@ -1,0 +1,62 @@
+# A tour of l0puh.
+#
+#   l0p run examples/tour.l0p
+
+# --- imports ---------------------------------------------------------------
+import helpers
+from helpers import twice
+import pkg.util as util
+
+# --- bindings --------------------------------------------------------------
+const LIMIT = 10
+var total = 0
+
+# --- functions -------------------------------------------------------------
+def fib(n):
+    if n < 2:
+        return n
+    return fib(n - 1) + fib(n - 2)
+
+# --- records ---------------------------------------------------------------
+struct Point:
+    x = 0
+    y = 0
+
+# --- values ----------------------------------------------------------------
+let add = (a, b = 2) -> a + b
+let xs = [1, 2, 3]
+let m = {"k": 1}
+let name = "l0puh"
+let banner = "hello, ${name}! ${1 + 2}"
+
+# --- control flow ----------------------------------------------------------
+for x in xs:
+    total += add(x, twice(0))
+
+while total > LIMIT:
+    total -= 1
+    if total == 3:
+        continue
+    else:
+        break
+
+# --- closures --------------------------------------------------------------
+def counter():
+    var n = 0
+    def inc():
+        n = n + 1
+        return n
+    return inc
+
+let tick = counter()
+
+# --- output ----------------------------------------------------------------
+print(banner)
+print("fib(10) =", fib(10))
+print("total =", total, "limit =", LIMIT)
+print("twice(21) =", twice(21), "util.name =", util.name)
+print("struct:", Point().x, Point(3, 4).x, Point(3, 4).y)
+print("list:", xs, "len", xs.len(), "dict:", m)
+print("closure:", tick(), tick(), tick())
+
+total

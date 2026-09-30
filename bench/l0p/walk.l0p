@@ -1,0 +1,8 @@
+# Walking a 1M-element list: iteration, not arithmetic.
+def f(n):
+    let l = range(n)
+    var t = 0
+    for x in l:
+        t = t + x
+    return t
+f(1000000)

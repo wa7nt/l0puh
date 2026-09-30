@@ -1,0 +1,6 @@
+# A module the tour imports.  Everything declared at the top level is exported.
+
+let tag = "h"
+
+def twice(n):
+    return n * 2
