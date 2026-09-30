@@ -15,5 +15,6 @@
     "parse": "node src/cli/main.ts parse",
     "lex": "node src/cli/main.ts lex"
   },
-  "private": true
+  "private": true,
+  "license": "MIT"
 }
