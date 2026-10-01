@@ -334,7 +334,19 @@ const char *l0p_type_name(L0pValue v) {
         case L0P_TRUE:
         case L0P_FALSE:  return "bool";
         case L0P_INT:    return "int";
-        case L0P_FLOAT:  return "float";
+        case L0P_FLOAT:
+            /*
+             * The interpreter has one numeric type, a double, and calls a number
+             * an `int` when the value has no fractional part -- `Number.isInteger`
+             * -- not when it happens to fit in a machine integer.  So 1e20 is an
+             * `int` there and a `float` here, because a double is wider than
+             * int64 and the literal could not be tagged INT.
+             *
+             * Asking about the value rather than the tag is what makes the two
+             * agree.  An INT always holds a whole number, so this only ever
+             * changes the answer for a FLOAT, and only when it is in fact whole.
+             */
+            return (isfinite(v.u.d) && v.u.d == trunc(v.u.d)) ? "int" : "float";
         case L0P_STR:    return "str";
         case L0P_LIST:   return "list";
         case L0P_DICT:   return "dict";
@@ -715,7 +727,20 @@ L0pValue l0p_div(L0pValue a, L0pValue b) {
         L0P_ERR("l0puh: division by zero\n");
         l0p_abort();
     }
-    if (both_int(a, b) && b.u.i != -1 && (a.u.i % b.u.i) == 0) return l0p_int(a.u.i / b.u.i);
+    /*
+     * The exact-division shortcut is for the answer, not for the quotient.
+     *
+     * `b != -1` was here because INT64_MIN / -1 is a trap -- the quotient is
+     * 2^63, which int64 cannot hold, and x86 `idiv` raises #DE on it.  But
+     * excluding every divisor of -1 also excluded the perfectly ordinary
+     * `6 / -1`, which is exact and safe, and sent it down the float path.  The
+     * value came out as a float holding -6, and `type(6 / -1)` answered `float`
+     * where the interpreter answers `int`.
+     *
+     * So name the pair that actually traps.  `b == 0` was already returned above.
+     */
+    if (both_int(a, b) && !(a.u.i == INT64_MIN && b.u.i == -1) && (a.u.i % b.u.i) == 0)
+        return l0p_int(a.u.i / b.u.i);
     return l0p_float(l0p_num("/", a) / y);
 }
 

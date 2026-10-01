@@ -542,3 +542,51 @@ describe("inlined integer arithmetic", { skip: SKIP }, () => {
     agreeOut("print(12345.6789)");
   });
 });
+
+/*
+ * How a number is named.
+ *
+ * The interpreter has one numeric type -- a double -- and decides `int` from the
+ * value, with `Number.isInteger`.  It has no separate float type for literals:
+ * `type(100.0)` is `int` and `type(7 / 2)` is `float`.  So the question "int or
+ * float?" is about the number, never about how it happens to be stored, and any
+ * backend that answers it from a tag is answering a different question.
+ */
+describe("int and float are properties of the value", { skip: SKIP }, () => {
+  it("names a whole number an int however it was written", () => {
+    agreeOut("print(type(100.0))");      // a float literal, but a whole number
+    agreeOut("print(type(1e6))");
+    agreeOut("print(type(10 ** 18))");
+  });
+
+  it("names a number wider than int64 an int, because it is whole", () => {
+    /*
+     * 1e20 and 1e21 exceed int64, so the literal cannot be tagged INT and has to
+     * be stored as a double.  The tag says `float`; the value has no fractional
+     * part, and the interpreter answers `int`.  Asking about the value is what
+     * closes the gap.
+     */
+    agreeOut("print(type(1e20))");
+    agreeOut("print(type(1e21))");
+  });
+
+  it("names a number with a fractional part a float", () => {
+    agreeOut("print(type(7 / 2))");
+    agreeOut("print(type(7 - 0.5))");
+    agreeOut("print(type(2 ** 0.5))");
+    agreeOut("print(type(1e15 + 0.5))");
+  });
+
+  it("calls an exact division by -1 an int", () => {
+    /*
+     * `b != -1` guarded `l0p_div` against INT64_MIN / -1, which traps.  It also
+     * excluded the ordinary `6 / -1`, which is exact and safe, and answered
+     * `float` -- a float holding a whole number.  The guard had to name the pair
+     * that actually traps, not every divisor of -1.
+     */
+    agreeOut("print(type(6 / -1))");
+    agreeOut("print(type(6 / 2))");
+    agreeOut("print(type(6 / -2))");
+    agreeOut("print(6 / -1)");
+  });
+});
