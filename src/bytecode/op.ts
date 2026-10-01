@@ -123,8 +123,6 @@ export const OP_NAME: Readonly<Record<OpKind, string>> = {
   [OP.Halt]: "Halt",
 };
 
-export type OpKind = (typeof OP)[keyof typeof OP];
-
 export interface Op {
   op: OpKind;
   a: number;

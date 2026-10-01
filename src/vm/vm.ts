@@ -15,7 +15,7 @@
  * `run`, so entering a module does not allocate them.
  */
 
-import type { Binding, ImportSpec } from "../ast.ts";
+import type { Binding, Import } from "../ast.ts";
 import { constLabel, type Constant, type Module, type Proto } from "../bytecode/code.ts";
 import { binName, formatCode, OP, OP_NAME, unName, BIN, UN, type Op } from "../bytecode/op.ts";
 
@@ -727,7 +727,7 @@ export class Vm {
       throw this.error(frame, 0, "this program imports modules but has no module loader");
     }
     const module = frame.module;
-    const spec = module.imports[specIndex] as ImportSpec;
+    const spec = module.imports[specIndex] as Import;
     const current = currentModuleRecord(loader, module);
     const bindings = loader.resolveImport(spec, current);
 
@@ -828,7 +828,7 @@ export interface ModuleRecordLike {
 }
 
 export interface ModuleLoaderLike {
-  resolveImport(stmt: ImportSpec, from: ModuleRecordLike): ImportBindingLike[];
+  resolveImport(stmt: Import, from: ModuleRecordLike): ImportBindingLike[];
   compileModule(record: ModuleRecordLike): Module;
   recordFor(module: Module): ModuleRecordLike;
 }

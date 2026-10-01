@@ -29,7 +29,7 @@
  * would be a second project; this one is for generating code, not reading it.
  */
 
-import type { Block, Instr, IrFunc, IrModule, Operand, VReg } from "../ir/ir.ts";
+import type { Block, Instr, IrFunc, IrModule, Operand, Phi, VReg } from "../ir/ir.ts";
 
 /** A value is 16 bytes: a tag and a payload. */
 const VALUE_BYTES = 16;
@@ -90,6 +90,15 @@ interface Frame {
   /** vreg -> byte offset below %rbp, always a multiple of 16. */
   slot: Map<VReg, number>;
   size: number;
+  /**
+   * String literal -> its index in the module's .rodata table.
+   *
+   * Declared here as well as being passed in, because using a field the interface
+   * does not mention is invisible: `private` and excess properties are both
+   * erased, so the code runs and nothing complains until something reads the
+   * interface.
+   */
+  strings: Map<string, number>;
   /** Bytes a call must reserve for arguments that spill past the registers. */
   outgoing: number;
   /** The most phis in any one block, which sizes the copy-through area. */
@@ -485,12 +494,14 @@ export function compileFunc(
  */
 function phiCopies(frame: Frame, from: Block, to: Block): string[] {
   const out: string[] = [];
-  const edges = to.params
-    .map((p) => ({ p, inc: p.incoming.find((x) => x.from === from.id) }))
-    .filter((e) => e.inc !== undefined);
+  const edges: { p: Phi; inc: NonNullable<Phi["incoming"][number]> }[] = [];
+  for (const p of to.params) {
+    const inc = p.incoming.find((x) => x.from === from.id);
+    if (inc !== undefined) edges.push({ p, inc });
+  }
 
   for (let k = 0; k < edges.length; k++) {
-    const e = edges[k] as { p: Block["params"][number]; inc: NonNullable<ReturnType<typeof findInc>> };
+    const e = edges[k] as { p: Phi; inc: NonNullable<Phi["incoming"][number]> };
     const v = e.inc.value;
     if (v.t !== "vreg") throw new CodegenError(`phi v${e.p.dest} has a non-value input`, e.p.line);
     const s = frame.scratch(k);
@@ -501,7 +512,7 @@ function phiCopies(frame: Frame, from: Block, to: Block): string[] {
     out.push(`  movq %rax, ${s + 8}(%rbp)`);
   }
   for (let k = 0; k < edges.length; k++) {
-    const e = edges[k] as { p: Block["params"][number]; inc: NonNullable<ReturnType<typeof findInc>> };
+    const e = edges[k] as { p: Phi; inc: NonNullable<Phi["incoming"][number]> };
     const s = frame.scratch(k);
     out.push(`  movq ${s}(%rbp), %rax`);
     out.push(`  movq %rax, ${off(frame, e.p.dest)}(%rbp)`);
@@ -511,10 +522,6 @@ function phiCopies(frame: Frame, from: Block, to: Block): string[] {
   return out;
 }
 
-function findInc(): Operand {
-  // Only used for the type of `incoming` above; never called.
-  return { t: "imm", value: 0 };
-}
 
 /**
  * Make a name safe to put inside an assembly string literal.
