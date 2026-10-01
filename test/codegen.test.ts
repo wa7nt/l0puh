@@ -590,3 +590,86 @@ describe("int and float are properties of the value", { skip: SKIP }, () => {
     agreeOut("print(6 / -1)");
   });
 });
+
+/*
+ * The three operators that divide.
+ *
+ * They are the awkward ones: x86's `idiv` raises #DE on a zero divisor and on
+ * INT64_MIN / -1, and #DE is not a catchable fault -- it kills the process with
+ * SIGFPE, so no code here gets the chance to report anything.  Every guard
+ * therefore has to come before the instruction, and every trap has to reach the
+ * runtime, which raises a proper error instead.
+ */
+describe("inlined division", { skip: SKIP }, () => {
+  it("truncates toward zero, like the instruction does", () => {
+    // `/` truncates, `//` floors, `%` takes the sign of the dividend.  All three
+    // differ from one another on negatives, which is where an inline path is
+    // most likely to quietly pick the wrong one.
+    for (const e of [
+      "6 / 2", "7 / 2", "-7 / 2", "7 / -2", "-7 / -2", "6 / -1", "0 / 5",
+      "6 // 4", "7 // 2", "-7 // 2", "7 // -2", "-7 // -2", "-6 // 4", "6 // -4",
+      "6 % 4", "7 % 2", "-7 % 2", "7 % -2", "-7 % -2", "6 % -4", "-6 % 4", "7 % -4",
+      "2.5 / 0.5", "7 / 2.0", "1 / 3",
+    ]) agreeOut(`print(${e})`);
+  });
+
+  it("survives the pair that traps idiv", () => {
+    /*
+     * INT64_MIN / -1 is a real division with no int64 answer: the quotient is
+     * 2^63.  `idiv` raises #DE rather than returning it, and `l0p_div` widens to
+     * a double.  `INT64_MIN % -1` also traps, though the remainder is defined
+     * and is zero.  If any guard were missing the process would die with SIGFPE
+     * and print nothing at all.
+     */
+    for (const e of [
+      "-9223372036854775808 / -1", "-9223372036854775808 % -1",
+      "-9223372036854775808 // -1", "-9223372036854775808 / 1",
+      "-9223372036854775808 % 2", "5 / -1", "5 // -1", "5 % -1",
+    ]) agreeOut(`print(${e})`);
+  });
+
+  it("checks both traps before dividing", () => {
+    const asm = compileModule(lowerProgram(parse("let x = 6\nlet y = 2\nx / y\n"), "t.l0p"));
+    const body = asm.slice(asm.indexOf("# div, inline"));
+    const zero = body.indexOf("testq %rcx, %rcx");
+    const idiv = body.indexOf("idivq %rcx");
+    // The zero test has to come first, or the instruction runs on a zero divisor.
+    assert.ok(zero !== -1 && zero < idiv, "the zero divisor test must precede idiv");
+    // So must the INT64_MIN test, which needs a register because cmpq has no
+    // 64-bit immediate -- the assembler rejects both 0x8000000000000000 and the
+    // signed literal.
+    assert.match(body, /movabsq \$-9223372036854775808, %r8/);
+    assert.ok(body.indexOf("movabsq") < idiv, "the INT64_MIN test must precede idiv");
+  });
+
+  it("falls back when the division is not exact, so `/` stays a float", () => {
+    // 7/2 is 3.5.  Truncating to 3 would be an int, and `type(7 / 2)` would stop
+    // agreeing with the interpreter; the runtime makes the float properly.
+    const asm = compileModule(lowerProgram(parse("let x = 7\nlet y = 2\nx / y\n"), "t.l0p"));
+    const body = asm.slice(asm.indexOf("# div, inline"), asm.indexOf("# div, inline") + 900);
+    assert.match(body, /testq %rdx, %rdx/, "a non-zero remainder must leave the fast path");
+  });
+
+  it("reports division by zero instead of trapping", () => {
+    /*
+     * The guards exist so that this arrives at the runtime, which prints
+     * `division by zero` and aborts.  If either guard were dropped the process
+     * would take SIGFPE and there would be no message to check -- so the test is
+     * that it exits, and says why.
+     */
+    for (const e of ["1 / 0", "1 // 0", "1 % 0", "0 / 0", "-1 / 0"]) {
+      const built = buildNative(`print(${e})\n`, PRINTED);
+      let out = "";
+      let sig: string | null = null;
+      try {
+        out = execFileSync(built.binary, { encoding: "utf8" });
+      } catch (err) {
+        const x = err as { stdout?: string; stderr?: string; signal?: string };
+        out = (x.stdout ?? "") + (x.stderr ?? "");
+        sig = x.signal ?? null;
+      }
+      assert.notEqual(sig, "SIGFPE", `${e} trapped instead of reporting the error`);
+      assert.match(out, /division by zero/, `${e} did not explain itself`);
+    }
+  });
+});

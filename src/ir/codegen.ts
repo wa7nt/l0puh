@@ -233,9 +233,10 @@ function emitInlineInt(
   helper: string,
   /**
    * The arithmetic, with `%rax` holding the left payload and `%rcx` the right on
-   * entry.  Given the slow-path label, so the overflow branch can name it.
+   * entry.  Given the slow-path label, so the overflow branch can name it, and a
+   * factory for private labels, because a division needs more than one branch.
    */
-  compute: (slow: string) => readonly string[],
+  compute: (slow: string, label: (what: string) => string) => readonly string[],
 ): string[] {
   const out: string[] = [];
   const d = i.dest;
@@ -248,6 +249,7 @@ function emitInlineInt(
   const n = thisTag++;
   const slow = `.L${helper}_slow${n}`;
   const done = `.L${helper}_done${n}`;
+  const label = (what: string): string => `.L${helper}_${what}${n}`;
 
   out.push(`  # ${i.op}, inline when both operands are integers`);
   out.push(`  movq ${off(frame, a.v) + 8}(%rbp), %rax`);
@@ -256,7 +258,7 @@ function emitInlineInt(
   out.push(`  movq ${off(frame, b.v) + 8}(%rbp), %rcx`);
   out.push(`  cmpq $${TAG.INT}, ${off(frame, b.v)}(%rbp)`);
   out.push(`  jne ${slow}`);
-  for (const line of compute(slow)) out.push(`  ${line}`);
+  for (const line of compute(slow, label)) out.push(`  ${line}`);
   out.push(`  movq $${TAG.INT}, ${off(frame, d)}(%rbp)`);
   out.push(`  movq %rax, ${off(frame, d) + 8}(%rbp)`);
   out.push(`  jmp ${done}`);
@@ -1022,6 +1024,98 @@ function instr(frame: Frame, i: Instr): string[] {
         "imulq %rcx, %rax",
         // IMUL sets OF when the product does not fit in the destination.
         `jo ${slow}`,
+      ]);
+
+    /*
+     * The three operators that divide, which cannot be inlined the way `add` is.
+     *
+     * x86's `idiv` raises #DE on two inputs, and #DE is not a catchable fault: it
+     * ends the process with SIGFPE, so the program dies without printing an
+     * error and the value that would have been returned never exists.
+     *
+     *     divisor 0             `a / 0` is an error the runtime reports properly
+     *     INT64_MIN / -1        the quotient is 2^63, which int64 cannot hold
+     *
+     * The second is not an exotic corner.  `a / -1` is an ordinary expression and
+     * traps for exactly one value of `a`, so a guard on `b == -1` would be wrong
+     * -- it is what `l0p_div` did, and it made `6 / -1` a float holding a whole
+     * number.  Both tests have to precede the instruction, and both failures have
+     * to reach the runtime, which raises the proper error rather than a signal.
+     *
+     * `INT64_MIN % -1` traps too, though the remainder is defined and is zero.
+     *
+     * `cmpq` has no 64-bit immediate, so INT64_MIN goes through `movabsq` into a
+     * scratch register -- the assembler rejects both `$0x8000000000000000` and
+     * the signed literal.
+     */
+    case "div":
+      return emitInlineInt(frame, i, "l0p_div", (slow, label) => [
+        "testq %rcx, %rcx",
+        `je ${slow}`,                        // division by zero: the runtime says so
+        "cmpq $-1, %rcx",
+        `jne ${label("ok")}`,               // any divisor but -1 is safe
+        "movabsq $-9223372036854775808, %r8",
+        "cmpq %r8, %rax",
+        `je ${slow}`,                        // INT64_MIN / -1 traps
+        `${label("ok")}:`,
+        "cqto",
+        "idivq %rcx",
+        // `rax` is now the quotient and `rdx` the remainder.  Only an exact
+        // division yields an int; anything else is a float, which needs the
+        // runtime's rounding rather than a truncation.
+        "testq %rdx, %rdx",
+        `jne ${slow}`,
+      ]);
+
+    case "floordiv":
+      return emitInlineInt(frame, i, "l0p_floordiv", (slow, label) => [
+        "testq %rcx, %rcx",
+        `je ${slow}`,
+        "cmpq $-1, %rcx",
+        `jne ${label("ok")}`,
+        "movabsq $-9223372036854775808, %r8",
+        "cmpq %r8, %rax",
+        `je ${slow}`,
+        `${label("ok")}:`,
+        "cqto",
+        "idivq %rcx",
+        /*
+         * `idiv` truncates toward zero and floor goes down, so the two differ
+         * whenever a negative answer has a remainder -- `-7 // 2` is -4 here and
+         * -3 from the instruction.  It is exactly the case where the remainder
+         * is non-zero and its sign differs from the divisor's.
+         */
+        "testq %rdx, %rdx",
+        `je ${label("floor")}`,             // no remainder: truncation is the floor
+        "movq %rdx, %r8",
+        "sarq $63, %r8",                     // all ones if the remainder is negative
+        "movq %rcx, %r9",
+        "sarq $63, %r9",                     // all ones if the divisor is negative
+        "cmpq %r8, %r9",
+        `je ${label("floor")}`,             // same sign: truncation is the floor
+        "decq %rax",
+        `${label("floor")}:`,
+      ]);
+
+    case "mod":
+      return emitInlineInt(frame, i, "l0p_mod", (slow, label) => [
+        "testq %rcx, %rcx",
+        `je ${slow}`,
+        "cmpq $-1, %rcx",
+        `jne ${label("ok")}`,
+        "movabsq $-9223372036854775808, %r8",
+        "cmpq %r8, %rax",
+        `je ${slow}`,                        // INT64_MIN % -1 traps; the answer is 0
+        `${label("ok")}:`,
+        "cqto",
+        "idivq %rcx",
+        /*
+         * `idiv` leaves the remainder in `rdx` with the sign of the dividend,
+         * which is C's `%`, which is the interpreter's `%`.  Not Python's rule,
+         * which normalises to the divisor's sign -- but matching the reference
+         * is the point, and a native `7 % -3` of 1 is what the interpreter says.
+         */
+        "movq %rdx, %rax",
       ]);
 
     case "lt":
