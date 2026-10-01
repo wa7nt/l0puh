@@ -157,12 +157,101 @@ L0pStr *l0p_str_from_i64(L0pArena *a, int64_t v) {
  * agree: 0.1 + 0.2 has to print as 0.30000000000000004 on both sides, or a
  * differential test fails on arithmetic that was in fact correct.
  */
+/*
+ * The text the interpreter would print.
+ *
+ * The interpreter holds numbers in JavaScript doubles and formats them the way
+ * JavaScript does, so this has to agree: shortest form that reads back as the
+ * same double, and *no exponent* below 1e21.  `%g` switches to exponential as
+ * soon as it saves a character, so 2^63 came out as `9.223372036854776e+18` where
+ * the interpreter prints `9223372036854776000` -- the same double, and two
+ * different answers to `print`.
+ */
+/*
+ * The text the interpreter would print.
+ *
+ * The interpreter holds numbers in JavaScript doubles and formats them the way
+ * JavaScript does.  Two rules have to match or every differential test over
+ * floating point fails for a reason that has nothing to do with the compiler:
+ *
+ *   - shortest digit string that reads back as the same double;
+ *   - positional notation between 1e-6 and 1e21, exponential outside.
+ *
+ * `%g` satisfies neither: it switches to exponential whenever a character is
+ * saved, so 2^63 printed as `9.223372036854776e+18` where the interpreter prints
+ * `9223372036854776000`.  The same double, and two different answers to `print`.
+ *
+ * So: find the shortest digits with `%e`, which always uses exponential form and
+ * therefore always gives exactly the digits, then lay them out by hand.
+ */
 static void fmt_double(double d, char *buf, uint64_t cap) {
-    for (int prec = 1; prec <= 17; prec++) {
-      snprintf(buf, cap, "%.*g", prec, d);
-      if (strtod(buf, NULL) == d) return;
+    if (isnan(d)) { snprintf(buf, cap, "nan"); return; }
+    if (isinf(d)) { snprintf(buf, cap, d > 0 ? "inf" : "-inf"); return; }
+
+    char tmp[48];
+    int prec = 0;
+    for (prec = 0; prec <= 17; prec++) {
+        snprintf(tmp, sizeof tmp, "%.*e", prec, d);
+        if (strtod(tmp, NULL) == d) break;
     }
-    snprintf(buf, cap, "%.17g", d);
+
+    /* Split "-d.dddde+XX" into a sign, the digits, and the exponent. */
+    const char *p = tmp;
+    int neg = 0;
+    if (*p == '-') { neg = 1; p++; }
+    char digits[24];
+    int nd = 0;
+    for (; *p != 0 && *p != 'e'; p++) {
+        if (*p == '.') continue;
+        digits[nd++] = *p;
+    }
+    digits[nd] = 0;
+    /* The loop stopped at 'e' if there is one; if not, the value had no exponent. */
+    int exp10 = (*p == 0) ? 0 : atoi(p + 1);
+
+    /*
+     * JavaScript's rule: positional from 1e-6 up to 1e21, exponential below
+     * and above.  `exp10` is the power of the first digit, so the number is
+     * 0.d1d2... x 10^(exp10+1) and the thresholds translate directly.
+     */
+    if (exp10 < -6 || exp10 >= 21) {
+        if (nd > 1) {
+            snprintf(buf, cap, "%s%c.%se%+d", neg ? "-" : "", digits[0], digits + 1, exp10);
+        } else {
+            snprintf(buf, cap, "%s%ce%+d", neg ? "-" : "", digits[0], exp10);
+        }
+        return;
+    }
+
+    if (exp10 >= 0) {
+        /* Whole part is the first exp10+1 digits, padded with zeros. */
+        int whole = exp10 + 1;
+        int i = 0;
+        size_t at = 0;
+        if (neg && at + 1 < cap) buf[at++] = '-';
+        for (; i < whole; i++) {
+            if (at + 1 >= cap) break;
+            buf[at++] = i < nd ? digits[i] : '0';
+        }
+        if (nd > whole && at + 1 < cap) {
+            buf[at++] = '.';
+            for (i = whole; i < nd; i++) {
+                if (at + 1 >= cap) break;
+                buf[at++] = digits[i];
+            }
+        }
+        buf[at] = 0;
+        return;
+    }
+
+    /* 0.000ddd */
+    size_t at = 0;
+    if (neg && at + 1 < cap) buf[at++] = '-';
+    buf[at++] = '0';
+    buf[at++] = '.';
+    for (int z = 0; z < -exp10 - 1 && at + 1 < cap; z++) buf[at++] = '0';
+    for (int i = 0; i < nd && at + 1 < cap; i++) buf[at++] = digits[i];
+    buf[at] = 0;
 }
 
 L0pStr *l0p_str_from_double(L0pArena *a, double v) {

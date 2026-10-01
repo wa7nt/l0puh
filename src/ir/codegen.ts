@@ -203,6 +203,127 @@ function doubleBits(x: number): bigint {
 }
 
 /**
+ * Integer arithmetic, inline, with a fallback.
+ *
+ * The shape is the whole idea:
+ *
+ *     cmpq $INT, tag_a ;  jne  slow     # not an integer
+ *     cmpq $INT, tag_b ;  jne  slow     # not an integer
+ *     <the operation>  ; jo   slow      # or it overflowed
+ *     <store the result>  ; jmp  done
+ *   slow:
+ *     callq _l0p_add
+ *     <store the result>
+ *   done:
+ *
+ * Nothing here needs to know anything about types, and nothing is assumed.  Each
+ * test costs one instruction and one branch; the call it replaces costs a call, a
+ * frame, and a return.  On a value the interpreter cannot represent exactly --
+ * a float, a string, or an integer that overflows -- the code falls through to
+ * the same runtime helper it always did, so the answer is the answer it was.
+ *
+ * The overflow test is not optional.  `l0p_add` widens to a double when the sum
+ * leaves int64; an inlined `addq` wraps.  Silently disagreeing with the reference
+ * on overflow is the exact failure this project exists to avoid, and `jo` is one
+ * instruction that prevents it.
+ */
+function emitInlineInt(
+  frame: Frame,
+  i: Instr,
+  helper: string,
+  /**
+   * The arithmetic, with `%rax` holding the left payload and `%rcx` the right on
+   * entry.  Given the slow-path label, so the overflow branch can name it.
+   */
+  compute: (slow: string) => readonly string[],
+): string[] {
+  const out: string[] = [];
+  const d = i.dest;
+  if (d === null) throw new CodegenError(`${i.op} defines nothing`, i.line);
+  const a = i.args[0];
+  const b = i.args[1];
+  if (a === undefined || b === undefined || a.t !== "vreg" || b.t !== "vreg") {
+    throw new CodegenError(`${i.op} needs two values`, i.line);
+  }
+  const n = thisTag++;
+  const slow = `.L${helper}_slow${n}`;
+  const done = `.L${helper}_done${n}`;
+
+  out.push(`  # ${i.op}, inline when both operands are integers`);
+  out.push(`  movq ${off(frame, a.v) + 8}(%rbp), %rax`);
+  out.push(`  cmpq $${TAG.INT}, ${off(frame, a.v)}(%rbp)`);
+  out.push(`  jne ${slow}`);
+  out.push(`  movq ${off(frame, b.v) + 8}(%rbp), %rcx`);
+  out.push(`  cmpq $${TAG.INT}, ${off(frame, b.v)}(%rbp)`);
+  out.push(`  jne ${slow}`);
+  for (const line of compute(slow)) out.push(`  ${line}`);
+  out.push(`  movq $${TAG.INT}, ${off(frame, d)}(%rbp)`);
+  out.push(`  movq %rax, ${off(frame, d) + 8}(%rbp)`);
+  out.push(`  jmp ${done}`);
+  out.push(`${slow}:`);
+  out.push("  # not integers, or the result left int64: the runtime decides");
+  out.push(...placeArgs(frame, ["value", "value"], i.args, i.line));
+  out.push(`  callq _${helper}`);
+  out.push(`  movq %rax, ${off(frame, d)}(%rbp)`);
+  out.push(`  movq %rdx, ${off(frame, d) + 8}(%rbp)`);
+  out.push(`${done}:`);
+  return out;
+}
+
+/**
+ * The same shape for a comparison, which yields a boolean rather than a number.
+ */
+function emitInlineCompare(
+  frame: Frame,
+  i: Instr,
+  helper: string,
+  /** `setae`, `seta`, `setg`, `setl`: an unsigned-style condition byte write. */
+  set: string,
+  signed: boolean,
+): string[] {
+  const out: string[] = [];
+  const d = i.dest;
+  if (d === null) throw new CodegenError(`${i.op} defines nothing`, i.line);
+  const a = i.args[0];
+  const b = i.args[1];
+  if (a === undefined || b === undefined || a.t !== "vreg" || b.t !== "vreg") {
+    throw new CodegenError(`${i.op} needs two values`, i.line);
+  }
+  const n = thisTag++;
+  const slow = `.L${helper}_slow${n}`;
+  const done = `.L${helper}_done${n}`;
+
+  out.push(`  # ${i.op}, inline when both operands are integers`);
+  out.push(`  movq ${off(frame, a.v) + 8}(%rbp), %rax`);
+  out.push(`  cmpq $${TAG.INT}, ${off(frame, a.v)}(%rbp)`);
+  out.push(`  jne ${slow}`);
+  out.push(`  movq ${off(frame, b.v) + 8}(%rbp), %rcx`);
+  out.push(`  cmpq $${TAG.INT}, ${off(frame, b.v)}(%rbp)`);
+  out.push(`  jne ${slow}`);
+  // `cmp` sets the flags for `a` against `b`; the condition byte is what the
+  // caller asked for.  Signed and unsigned differ only in the prefix.
+  if (signed) out.push(`  cmpq %rcx, %rax`);
+  else out.push(`  cmpq %rax, %rcx`);
+  out.push(`  ${set} %al`);
+  out.push("  movzbq %al, %rax");
+  out.push(`  # pack the boolean: tag TRUE or FALSE, payload zero`);
+  out.push(`  movq $${TAG.FALSE}, ${off(frame, d)}(%rbp)`);
+  out.push(`  movq $${TAG.FALSE}, ${off(frame, d) + 8}(%rbp)`);
+  out.push("  testq %rax, %rax");
+  out.push(`  je ${done}`);
+  out.push(`  movq $${TAG.TRUE}, ${off(frame, d)}(%rbp)`);
+  out.push(`  jmp ${done}`);
+  out.push(`${slow}:`);
+  out.push("  # not integers, or a string: the runtime compares");
+  out.push(...placeArgs(frame, ["value", "value"], i.args, i.line));
+  out.push(`  callq _${helper}`);
+  out.push(`  movq %rax, ${off(frame, d)}(%rbp)`);
+  out.push(`  movq %rdx, ${off(frame, d) + 8}(%rbp)`);
+  out.push(`${done}:`);
+  return out;
+}
+
+/**
  * A field name, emitted next to the instruction that needs it.
  *
  * Emitted inline rather than gathered into a table because a field name belongs
@@ -600,7 +721,19 @@ function instr(frame: Frame, i: Instr): string[] {
         storeValue(d);
         return out;
       }
-      if (!Number.isInteger(v.value)) {
+      /*
+       * A whole number that does not fit int64 is *not* an integer here.
+       *
+       * `Number.isInteger(2**63)` is true -- a double is a whole number long before
+       * it is a machine integer -- so the test passed and the literal went into
+       * the IR tagged INT, with its payload truncated to 64 bits.  `9223372036854775807`
+       * is read by JavaScript as 2^63, which as a pattern is INT64_MIN, so the
+       * constant became a large negative number and every arithmetic result
+       * built on it was wrong.  The range check is what catches it.
+       */
+      const whole = Number.isInteger(v.value);
+      const fitsInt = v.value >= -(2 ** 63) && v.value < 2 ** 63;
+      if (!whole || !fitsInt) {
         /*
          * The payload holds a raw double, so the literal's *bits* are what has to
          * be materialised: `movabsq` with the bit pattern, straight into the
@@ -867,6 +1000,41 @@ function instr(frame: Frame, i: Instr): string[] {
       out.push(`  movq %rax, ${off(frame, d) + 8}(%rbp)`);
       return out;
     }
+
+    case "add":
+      return emitInlineInt(frame, i, "l0p_add", (slow) => [
+        "movq %rcx, %rdx",
+        "addq %rdx, %rax",
+        // Overflow leaves int64, so the runtime's widening rule applies.  One
+        // branch here is cheaper than being wrong on it.
+        `jo ${slow}`,
+      ]);
+
+    case "sub":
+      // Subtraction of two int64s cannot overflow.
+      return emitInlineInt(frame, i, "l0p_sub", () => [
+        "movq %rcx, %rdx",
+        "subq %rdx, %rax",
+      ]);
+
+    case "mul":
+      return emitInlineInt(frame, i, "l0p_mul", (slow) => [
+        "imulq %rcx, %rax",
+        // IMUL sets OF when the product does not fit in the destination.
+        `jo ${slow}`,
+      ]);
+
+    case "lt":
+      return emitInlineCompare(frame, i, "l0p_lt", "setl", true);
+
+    case "le":
+      return emitInlineCompare(frame, i, "l0p_le", "setle", true);
+
+    case "gt":
+      return emitInlineCompare(frame, i, "l0p_gt", "setg", true);
+
+    case "ge":
+      return emitInlineCompare(frame, i, "l0p_ge", "setge", true);
 
     default: {
       const h = HELPERS[i.op];

@@ -453,3 +453,92 @@ describe("arithmetic refuses what the interpreter refuses", { skip: SKIP }, () =
     bothFail("float(null)");
   });
 });
+
+/*
+ * M15: integer arithmetic inlined behind a tag check.
+ *
+ * The point of the shape is that it assumes nothing.  Each test costs one
+ * instruction and one branch; the call it replaces costs a frame and a return.
+ * On anything the fast path cannot handle -- a float, a string, an integer that
+ * leaves int64 -- it falls through to the same runtime helper it always did, so
+ * the answer is the answer it was.
+ */
+describe("inlined integer arithmetic", { skip: SKIP }, () => {
+  it("computes without a call when both operands are integers", () => {
+    const asm = compileModule(lowerProgram(parse("def f(a, b):\n    a + b\nf(1, 2)\n"), "t.l0p"));
+    const body = asm.slice(asm.indexOf("_l0p_fn_1:"));
+    // The call still exists -- on the slow path.  What must not exist is a path
+    // that *only* calls.
+    assert.match(body, /# add, inline when both operands are integers/);
+    assert.match(body, /addq/);
+    assert.match(body, /callq _l0p_add/);
+    assert.match(body, /jne \.L/);
+  });
+
+  it("checks the overflow flag, so int64 arithmetic cannot wrap silently", () => {
+    /*
+     * This branch is the whole reason the inline path is safe.  `l0p_add` widens
+     * to a double when the sum leaves int64; a bare `addq` wraps to a negative
+     * number that is a perfectly plausible int64 and completely wrong.  The
+     * `jo` is what makes the two agree.
+     */
+    const add = compileModule(lowerProgram(parse("let x = 1\nlet y = 2\nx + y\n"), "t.l0p"));
+    assert.match(add, /addq[^\n]*\n\s*jo \.L/, "add must branch on overflow");
+    const mul = compileModule(lowerProgram(parse("let x = 2\nlet y = 3\nx * y\n"), "t.l0p"));
+    assert.match(mul, /imulq[^\n]*\n\s*jo \.L/, "mul must branch on overflow");
+  });
+
+  it("does not need an overflow branch for subtraction", () => {
+    // The difference between two int64 values always fits in an int64.
+    const asm = compileModule(lowerProgram(parse("let x = 5\nlet y = 2\nx - y\n"), "t.l0p"));
+    const line = asm.slice(asm.indexOf("# sub, inline"));
+    assert.doesNotMatch(line.slice(0, 400), /\bjo\b/);
+  });
+
+  it("agrees with the interpreter on results that overflow int64", () => {
+    /*
+     * Values chosen so that both sides are exact int64 operands: a literal is
+     * read as a double, so `9223372036854775807` is not expressible and rounds
+     * to 2^63.  2^62 is the largest power of two that survives, and doubling it
+     * is the smallest overflow worth testing.
+     */
+    const e = 4611686018427387904;
+    for (const src of [
+      `${e} * 2`, `${e} + ${e}`, `${e} * 4`, `${e} * ${e}`,
+      "3037000500 * 3037000500", "9007199254740991 * 2",
+    ]) {
+      agreeOut(`print(${src})`);
+    }
+  });
+
+  it("treats a whole literal too large for int64 as a float", () => {
+    /*
+     * `Number.isInteger(2**63)` is true -- a double is a whole number long before
+     * it is a machine integer -- so the natural range check lets it through and
+     * the literal gets tagged INT with its payload truncated to 64 bits.  As a bit
+     * pattern 2^63 is INT64_MIN, so `9223372036854775807` became a large negative
+     * number and everything computed from it was wrong.
+     */
+    const asm = compileModule(lowerProgram(parse("x = 9223372036854775807\nx"), "t.l0p"));
+    // Tag 4 is float; tag 3 would mean the truncated integer.
+    assert.match(asm, /movq \$4,/);
+    assert.doesNotMatch(asm, /movq \$3,/);
+  });
+
+  it("formats a double the way the interpreter does", () => {
+    /*
+     * `%g` switches to exponential whenever it saves a character, so 2^63 printed
+     * as `9.223372036854776e+18` where the interpreter prints
+     * `9223372036854776000`.  The same double, and two different answers to
+     * `print` -- which every differential test over floating point would blame on
+     * the compiler.
+     */
+    agreeOut("print(9223372036854775808.0)");
+    agreeOut("print(0.1 + 0.2)");
+    agreeOut("print(1e21)");
+    agreeOut("print(1e-7)");
+    agreeOut("print(1e-6)");
+    agreeOut("print(3.141592653589793)");
+    agreeOut("print(12345.6789)");
+  });
+});
