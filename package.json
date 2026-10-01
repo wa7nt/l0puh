@@ -16,5 +16,9 @@
     "lex": "node src/cli/main.ts lex"
   },
   "private": true,
-  "license": "MIT"
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^26.6.3",
+    "typescript": "^7.0.2"
+  }
 }

@@ -17,8 +17,13 @@
     "erasableSyntaxOnly": true,
     "isolatedModules": true,
 
+    // The source imports with explicit ".ts" extensions, because Node's type
+    // stripping requires them; a bundler would not, but there is no bundler here.
+    "allowImportingTsExtensions": true,
+
     "noEmit": true,
-    "skipLibCheck": true
+    "skipLibCheck": true,
+    "types": ["node"]
   },
   "include": ["src/", "test/"]
 }

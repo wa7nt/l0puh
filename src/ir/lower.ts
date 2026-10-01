@@ -22,7 +22,7 @@
 
 import type { Binary, BinaryOp, Call, Expr, Lambda, Program, Stmt, UnaryOp } from "../ast.ts";
 import { L0pError } from "../errors.ts";
-import { imm, sym, vreg, type IrFunc, type IrModule, type IrOp, type Operand, type VReg } from "./ir.ts";
+import { imm, vreg, type Block, type IrFunc, type IrModule, type IrOp, type Operand, type VReg } from "./ir.ts";
 import { FuncBuilder } from "./build.ts";
 
 /** Runtime helpers the backend knows how to lower. */
@@ -641,6 +641,50 @@ class Lowerer {
 
     b.setCurrent(exit);
   }
+
+  /**
+   * Lower a whole program and finish the module.
+   *
+   * A method rather than three field reads from a free function.  Reaching into
+   * another object's `private` members works perfectly well at run time --
+   * TypeScript's `private` is erased, so nothing stops it -- and that is exactly
+   * why it is worth avoiding: it compiles, it runs, and nothing complains.
+   *
+   * Index 0 is the module body, reserved before anything else is numbered.  The
+   * alternative, appending the module at the end, shifted every function index by
+   * one relative to the `@func:N` the lowering had already written into the IR, so
+   * a closure pointed at the module instead of at the function it named -- a
+   * valid pointer to valid code, running the wrong program, with nothing to
+   * indicate a problem.
+   */
+  moduleBody(p: Program, file: string | null): IrModule {
+    const body = this.current;
+    this.reserveFunction();
+    this.stmts(p.stmts);
+    /*
+     * A script's value is its last expression, the way the interpreter and the
+     * REPL both treat it.
+     *
+     * The return goes on whatever block that expression landed in, which is not
+     * the entry block when the expression was a ternary or followed a branch.
+     * Pinning it to the entry left the join block terminated with `unreachable`,
+     * so control ran off the end of the function and the program returned a
+     * garbage tag, printed as `<object>`.
+     */
+    body.returnModuleValue(this.last, p.stmts[p.stmts.length - 1]?.line ?? 0);
+    return {
+      name: file === null ? "<stdin>" : file,
+      file,
+      entry: 0,
+      funcs: [body.finish("<module>", [], []), ...this.funcs],
+      globalNames: [...this.globalKinds.keys()],
+      globalKinds: this.globalKinds,
+    };
+  }
+}
+
+export function lowerProgram(p: Program, file: string | null = null): IrModule {
+  return new Lowerer().moduleBody(p, file);
 }
 
 function asReg(o: Operand): VReg {
@@ -653,38 +697,4 @@ function unaryName(op: UnaryOp): string {
   if (op === "+") return "pos";
   if (op === "~") return "bitnot";
   return "not";
-}
-
-export function lowerProgram(p: Program, file: string | null = null): IrModule {
-  const l = new Lowerer();
-  /*
-   * Index 0 is the module body, reserved before anything else is numbered.
-   *
-   * The alternative -- appending the module at the end -- shifted every function
-   * index by one relative to the `@func:N` the lowering had already emitted, and
-   * a closure pointed at the module instead of the function it named.  That is
-   * silent: a valid pointer to valid code, running the wrong program.
-   */
-  const moduleBuilder = l.current;
-  l.reserveFunction();
-  l.stmts(p.stmts);
-  /*
-   * A script's value is its last expression, the way the interpreter and the REPL
-   * both treat it.
-   *
-   * The return goes on whatever block that expression landed in, which is not the
-   * entry block when the expression was a ternary or followed a branch.  Pinning
-   * it to the entry left the join block terminated with `unreachable`, so control
-   * ran off the end of the function and the program returned a garbage tag, which
-   * printed as `<object>`.
-   */
-  moduleBuilder.returnModuleValue(l.last, p.stmts[p.stmts.length - 1]?.line ?? 0);
-  const module_ = moduleBuilder.finish("<module>", [], []);  return {
-    name: file === null ? "<stdin>" : file,
-    file,
-    entry: 0,
-    funcs: [module_, ...l.funcs],
-    globalNames: [...l.globalKinds.keys()],
-    globalKinds: l.globalKinds,
-  };
 }

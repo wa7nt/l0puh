@@ -76,7 +76,14 @@ export class StructType {
     this.name = name;
     this.fields = fields;
     this.index = index;
-    this.entry = { name, params: [], nslots: 0, slotKinds: [], code: [], consts: [], protos: [], upvalues: [], isModule: false };
+    // `constValues` is read on every frame entry, so leaving it out here would
+    // hand the hot loop an `undefined` the moment a struct's entry proto was
+    // ever used as a frame.  Nothing calls it today, which is exactly why it
+    // would have survived: a field nobody reads until the day somebody does.
+    this.entry = {
+      name, params: [], nslots: 0, slotKinds: [], code: [],
+      consts: [], constValues: [], protos: [], upvalues: [], isModule: false,
+    };
   }
 }
 
@@ -237,6 +244,17 @@ export function toDisplay(v: Value): string {
 }
 
 export function repr(v: Value): string {
+  /*
+   * Null first, and not in the switch below.
+   *
+   * `typeof null` is `"object"` in JavaScript, so `case "null"` in a `typeof`
+   * switch names a value that `typeof` never returns.  The case was dead: it
+   * never ran, and `repr(null)` printed `null` only because the last line of the
+   * function is `String(v)`, which happens to spell it the same way.  That is the
+   * whole failure mode -- a branch that cannot execute, whose result is right for
+   * a reason unrelated to why the branch was there.
+   */
+  if (v === null) return "null";
   switch (typeof v) {
     case "number":
       return formatNumber(v);
@@ -244,22 +262,29 @@ export function repr(v: Value): string {
       return JSON.stringify(v);
     case "boolean":
       return v ? "true" : "false";
-    case "null":
-      return "null";
     default:
       break;
   }
-  if (Array.isArray(v)) return `[${v.map(repr).join(", ")}]`;
-  if (v instanceof Dict) {
-    return `{${v.entries().map(([k, val]) => `${repr(k)}: ${repr(val)}`).join(", ")}}`;
+  /*
+   * Past the primitives, only the object members remain.
+   *
+   * One assertion here, and then ordinary narrowing works for the whole
+   * `instanceof` chain below.  Without it TypeScript narrows `v` to `never` and
+   * then reports every property access as missing -- 28 complaints that say
+   * nothing about the code and everything about how `Value` is modelled.
+   */
+  const o = v as Value[] | Dict | Struct | StructType | Closure | Builtin | Iterator | ModuleRef;
+  if (Array.isArray(o)) return `[${o.map(repr).join(", ")}]`;
+  if (o instanceof Dict) {
+    return `{${o.entries().map(([k, val]: readonly [Value, Value]) => `${repr(k)}: ${repr(val)}`).join(", ")}}`;
   }
-  if (v instanceof Struct) {
-    return `${v.type.name}(${v.type.fields.map((f, i) => `${f}=${repr(v.values[i] ?? null)}`).join(", ")})`;
+  if (o instanceof Struct) {
+    return `${o.type.name}(${o.type.fields.map((f: string, i: number) => `${f}=${repr(o.values[i] ?? null)}`).join(", ")})`;
   }
-  if (v instanceof StructType) return `<struct ${v.name}>`;
-  if (v instanceof Closure) return `<fn ${v.name}>`;
-  if (v instanceof Builtin) return `<builtin ${v.name}>`;
-  if (v instanceof ModuleRef) return `<module ${v.name}>`;
+  if (o instanceof StructType) return `<struct ${o.name}>`;
+  if (o instanceof Closure) return `<fn ${o.name}>`;
+  if (o instanceof Builtin) return `<builtin ${o.name}>`;
+  if (o instanceof ModuleRef) return `<module ${o.name}>`;
   return String(v);
 }
 
@@ -270,6 +295,8 @@ export function formatNumber(n: number): string {
 }
 
 export function typeName(v: Value): string {
+  /* `typeof null` is `"object"`, so null is checked before the switch. */
+  if (v === null) return "null";
   switch (typeof v) {
     case "number":
       return Number.isInteger(v) ? "int" : "float";
@@ -277,8 +304,6 @@ export function typeName(v: Value): string {
       return "str";
     case "boolean":
       return "bool";
-    case "null":
-      return "null";
     default:
       break;
   }
