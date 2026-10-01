@@ -207,6 +207,8 @@ function makeRange(args: Value[]): Value {
 }
 
 function typeName(v: Value): string {
+  /* `typeof null` is `"object"`, so null is checked before the switch. */
+  if (v === null) return "null";
   switch (typeof v) {
     case "number":
       return Number.isInteger(v) ? "int" : "float";
@@ -214,8 +216,6 @@ function typeName(v: Value): string {
       return "str";
     case "boolean":
       return "bool";
-    case "null":
-      return "null";
     default:
       break;
   }

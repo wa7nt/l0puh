@@ -232,13 +232,12 @@ export function printFunc(f: IrFunc): string {
       if (i.dest !== null) nameOf.set(i.dest, `v${i.dest}`);
       lines.push(`  ${target}${i.op}${args === "" ? "" : ` ${args}`}${extra}`);
     }
-    if (i0(b.term) === null) lines.push("  (no terminator)");
-    else lines.push(`  ${printTerm(b.term, show)}`);
+    const term = b.term;
+    if (term === null) lines.push("  (no terminator)");
+    else lines.push(`  ${printTerm(term, show)}`);
   }
   return lines.join("\n");
 }
-
-const i0 = (t: Terminator | null): Terminator | null => t;
 
 function printTerm(t: Terminator, show: (o: Operand) => string): string {
   switch (t.t) {

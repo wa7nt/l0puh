@@ -175,7 +175,14 @@ export class Lexer {
     }
   }
 
-  private matchOperator(text: string, at: number): string | null {
+  /**
+   * The token type of the operator at `at`, or null.
+   *
+   * Typed `TokenType` rather than `string` because that is what it returns and
+   * what every caller does with it -- `OPENERS.includes(op)` is a lookup in a
+   * `TokenType[]`, and it silently never matched when the type said `string`.
+   */
+  private matchOperator(text: string, at: number): TokenType | null {
     for (const op of OPERATORS) {
       if (text.startsWith(op, at)) return op;
     }

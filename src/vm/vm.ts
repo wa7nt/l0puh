@@ -15,8 +15,8 @@
  * `run`, so entering a module does not allocate them.
  */
 
-import type { Binding, Import } from "../ast.ts";
-import { constLabel, type Constant, type Module, type Proto } from "../bytecode/code.ts";
+import type { Binding } from "../ast.ts";
+import { constLabel, type Constant, type ImportSpec, type Module, type Proto } from "../bytecode/code.ts";
 import { binName, formatCode, OP, OP_NAME, unName, BIN, UN, type Op } from "../bytecode/op.ts";
 
 // The operator indices are frozen here as plain literals on purpose.  A `switch`
@@ -70,7 +70,11 @@ export class Vm {
   private readonly stack: Value[] = [];
   private readonly frames: Frame[] = [];
   private readonly loader: ModuleLoaderLike | null;
-  private readonly printed: (text: string) => void;
+  /*
+   * Replaced on every `run`, so that a REPL can redirect output without
+   * constructing a VM per line.  Not readonly, for that reason.
+   */
+  private printed: (text: string) => void;
   /**
    * Retired frames, ready to be reused.  Cleared whenever the stacks are, so a
    * failure cannot leave one holding a live frame.
@@ -727,7 +731,16 @@ export class Vm {
       throw this.error(frame, 0, "this program imports modules but has no module loader");
     }
     const module = frame.module;
-    const spec = module.imports[specIndex] as Import;
+    /*
+     * The index comes from the bytecode, so it is not a value this code can trust.
+     * Reading past the end gives `undefined`, and handing that to the loader would
+     * be a fault inside the module system, far from the instruction that caused
+     * it.  Checked here, where the position is still known.
+     */
+    const spec = module.imports[specIndex];
+    if (spec === undefined) {
+      throw this.error(frame, 0, `import instruction refers to statement ${specIndex}, which this module does not have`);
+    }
     const current = currentModuleRecord(loader, module);
     const bindings = loader.resolveImport(spec, current);
 
@@ -781,6 +794,14 @@ export class Vm {
       retFrame: depth,
       module: nested,
       globals,
+      /*
+       * A module body captures nothing, so its frame is poolable.  Said
+       * explicitly rather than left undefined: the pooling test reads this field
+       * on every frame, and `!undefined` happens to be true, which is the same
+       * answer for the wrong reason -- and would stop being the right answer the
+       * day the test were written as `=== false`.
+       */
+      escaped: false,
     });
     try {
       this.execute(depth);
@@ -828,7 +849,7 @@ export interface ModuleRecordLike {
 }
 
 export interface ModuleLoaderLike {
-  resolveImport(stmt: Import, from: ModuleRecordLike): ImportBindingLike[];
+  resolveImport(stmt: ImportSpec, from: ModuleRecordLike): ImportBindingLike[];
   compileModule(record: ModuleRecordLike): Module;
   recordFor(module: Module): ModuleRecordLike;
 }

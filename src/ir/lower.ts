@@ -22,7 +22,7 @@
 
 import type { Binary, BinaryOp, Call, Expr, Lambda, Program, Stmt, UnaryOp } from "../ast.ts";
 import { L0pError } from "../errors.ts";
-import { imm, vreg, type Block, type IrFunc, type IrModule, type IrOp, type Operand, type VReg } from "./ir.ts";
+import { imm, vreg, type Block, type Instr, type IrFunc, type IrModule, type IrOp, type Operand, type VReg } from "./ir.ts";
 import { FuncBuilder } from "./build.ts";
 
 /** Runtime helpers the backend knows how to lower. */
@@ -333,9 +333,16 @@ class Lowerer {
       return this.call(e.callee.name, e.args.map((a) => this.expr(a)), e.line);
     }
     const callee = this.expr(e.callee);
-    return vreg(this.current.define("call", [callee, ...e.args.map((a) => this.expr(a))], e.line, {
-      name: e.callee.kind === "Ident" ? e.callee.name : undefined,
-    }));
+    /*
+     * `name` is set only when the callee was a bare identifier.
+     *
+     * Under `exactOptionalPropertyTypes` an explicit `undefined` is not the same
+     * as an absent property, so the key is omitted rather than set to undefined --
+     * a distinction that matters here because the backend reads it.
+     */
+    const info: Instr["info"] =
+      e.callee.kind === "Ident" ? { name: e.callee.name } : null;
+    return vreg(this.current.define("call", [callee, ...e.args.map((a) => this.expr(a))], e.line, info));
   }
 
   private call(name: string, args: Operand[], line: number): Operand {
@@ -463,9 +470,18 @@ class Lowerer {
       }
 
       case "Import":
-        this.globalKinds.set(s.alias ?? s.path.split(".").pop() as string, "def");
-        b.emit("call.builtin", [sym(`@import:${s.path}`)], s.line, { name: s.alias ?? s.path });
-        return;
+        /*
+         * The native backend has no module system yet.
+         *
+         * Said plainly, at the point the source is read, rather than left to
+         * produce a `call.builtin` the backend would have to special-case: the
+         * previous version emitted one and then died with a reference error
+         * inside the compiler, which is the least useful message available.
+         */
+        throw new L0pError(
+          "the native backend does not support imports yet; run this with `l0p run`",
+          s.line, s.col,
+        );
 
       case "Defer":
         b.emit("call.builtin", [this.expr(s.call.callee), ...s.call.args.map((a) => this.expr(a))], s.line, { name: "defer" });

@@ -16,7 +16,8 @@
  *    dictionary probe, which is what makes a `struct` worth having over a dict.
  */
 
-import type { Proto } from "../bytecode/code.ts";
+import type { Binding } from "../ast.ts";
+import type { ImportSpec, Proto } from "../bytecode/code.ts";
 
 export type Value = number | string | boolean | null | Value[] | Dict | Struct | StructType | Closure | Builtin | Iterator | ModuleRef;
 
@@ -206,6 +207,32 @@ export class ModuleRef {
  * closure captured must not go back into the pool, because the closure is still
  * holding it.
  */
+/**
+ * What a frame needs to know about the module it runs in.
+ *
+ * Structural, and declared here rather than imported, so that the value model does
+ * not depend on the loader.  Only the fields the VM actually reads are listed;
+ * adding one here is a deliberate statement that the VM needs it.
+ */
+export interface FrameModule {
+  readonly name: string;
+  readonly file: string | null;
+  readonly protos: readonly Proto[];
+  readonly entry: number;
+  readonly resultSlot: number | null;
+  /**
+   * The lowered import statements, in order, so a call site can find its own.
+   *
+   * The loader is handed the *source* `Import` node, and `ImportSpec` is the
+   * compiler's lowered form of it: same fields the loader reads, plus the local
+   * name and a position.  Naming the source type here would be a lie about what
+   * the array actually holds.
+   */
+  readonly imports: readonly ImportSpec[];
+  /** What kind each module-level name is, for the assignment check. */
+  readonly globalKinds: ReadonlyMap<string, Binding | "def">;
+}
+
 export interface Frame {
   proto: Proto;
   closure: Closure | null;
@@ -215,8 +242,16 @@ export interface Frame {
   /** Instruction to resume at when this frame returns. */
   retIp: number;
   retFrame: number;
-  /** The module this frame belongs to; a call cannot cross into another one. */
-  module: unknown;
+  /**
+   * The module this frame belongs to; a call cannot cross into another one.
+   *
+   * Typed structurally rather than as the loader's `Module`, because `value.ts`
+   * must not depend on `module/` -- the value model sits below the loader, and an
+   * import would invert that.  `unknown` would also be honest and is what this
+   * was, but it pushes a cast into every one of the six places that read it, and
+   * a cast in six places is six places where the wrong thing compiles.
+   */
+  module: FrameModule;
   /** Module-level names.  Shared with every frame the module calls into. */
   globals: Map<string, Value>;
   /** Set when a closure captures this frame; then it cannot be pooled. */
@@ -226,10 +261,16 @@ export interface Frame {
 export type { Proto };
 
 /** The shape the VM exposes to builtins, kept minimal to avoid a cycle. */
+/**
+ * What a built-in is allowed to touch.
+ *
+ * Only `print`.  The VM's stacks are private to `vm.ts` and stay there: listing
+ * them here would mean every built-in saw the whole machine, and `stack` would
+ * have to stop being `private` to satisfy the interface -- which is the opposite
+ * of what the restriction is for.
+ */
 export interface Vm {
   print(text: string): void;
-  readonly stack: Value[];
-  readonly frames: Frame[];
 }
 
 // ------------------------------------------------------------- formatting

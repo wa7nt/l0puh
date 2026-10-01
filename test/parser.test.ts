@@ -3,7 +3,7 @@ import { describe, it } from "node:test";
 
 import { L0pError } from "../src/errors.ts";
 import { parse } from "../src/parser.ts";
-import type { Expr, Stmt } from "../src/ast.ts";
+import type { Def, Expr, If, Stmt } from "../src/ast.ts";
 
 /** Strips positions so a tree can be compared against a plain literal. */
 function bare<T>(value: T): T {
@@ -19,7 +19,25 @@ function bare<T>(value: T): T {
   return value;
 }
 
-const stmts = (src: string): Stmt[] => bare(parse(src).stmts);
+const stmts = (src: string): Stmt[] => bare(parse(src).stmts) as Stmt[];
+
+/*
+ * Narrowing helpers.
+ *
+ * The tests used to reach into a node with `as { otherwise: Stmt[] }`, which is a
+ * claim the compiler will not accept -- and rightly: it is not true of every node,
+ * so the assertion could be describing the wrong statement.  Narrowing on `kind`
+ * says what is actually meant and fails when the node is a different one.
+ */
+const isIf = (s: Stmt | undefined): s is If & { otherwise: readonly Stmt[] | null } =>
+  s !== undefined && s.kind === "If";
+const isDef = (s: Stmt | undefined): s is Def => s !== undefined && s.kind === "Def";
+
+/** The body of a `def`, or an immediate failure naming what came instead. */
+const defBody = (s: Stmt): readonly Stmt[] => {
+  assert.ok(isDef(s), `expected a Def, got ${s.kind}`);
+  return s.body;
+};
 
 /** The single expression in a one-statement program. */
 const expr = (src: string): Expr => {
@@ -370,9 +388,11 @@ describe("control flow", () => {
   });
 
   it("nests else if instead of flattening it", () => {
-    const s = stmt("if a:\n    b\nelse if c:\n    d\nelse:\n    e\n") as { otherwise: Stmt[] };
-    assert.equal((s.otherwise[0] as Stmt).kind, "If");
-    assert.equal(((s.otherwise[0] as { otherwise: Stmt[] }).otherwise ?? []).length, 1);
+    const s = stmt("if a:\n    b\nelse if c:\n    d\nelse:\n    e\n");
+    assert.ok(isIf(s), "expected an If");
+    const inner = s.otherwise?.[0];
+    assert.ok(isIf(inner), "the else arm is itself an If, not a flattened one");
+    assert.equal(inner.otherwise?.length, 1);
   });
 
   it("reads while and for", () => {
@@ -387,10 +407,10 @@ describe("control flow", () => {
 
   it("reads return, break, continue and pass", () => {
     // `return` is only legal inside a `def`, so these live in one
-    assert.deepEqual((stmt("def f():\n    return 1\n") as { body: Stmt[] }).body[0], {
+    assert.deepEqual(defBody(stmt("def f():\n    return 1\n"))[0], {
       kind: "Return", value: { kind: "Num", value: 1 },
     });
-    assert.deepEqual((stmt("def f():\n    return\n") as { body: Stmt[] }).body[0], { kind: "Return", value: null });
+    assert.deepEqual(defBody(stmt("def f():\n    return\n"))[0], { kind: "Return", value: null });
     assert.deepEqual(stmt("break"), { kind: "Branch", what: "break" });
     assert.deepEqual(stmt("continue"), { kind: "Branch", what: "continue" });
     assert.deepEqual(stmt("pass"), { kind: "Branch", what: "pass" });
@@ -427,7 +447,9 @@ describe("imports", () => {
   });
 
   it("spreads names across lines", () => {
-    assert.deepEqual((stmt("from m import (\n  a,\n  b,\n)") as { names: string[] }).names, ["a", "b"]);
+    const s = stmt("from m import (\n  a,\n  b,\n)");
+    assert.equal(s.kind, "Import");
+    assert.deepEqual(s.names, ["a", "b"]);
   });
 
   it("says plainly that per-name aliases are missing", () => {

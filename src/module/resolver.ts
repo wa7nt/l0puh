@@ -40,7 +40,12 @@ export type ResolveResult =
 
 export class Resolver {
   private readonly fs: FileSystem;
-  private readonly searchPath: readonly string[];
+  /*
+   * Not readonly: `setSearchPath` exists to supply it after the resolver has
+   * been built, since the entry directory is not known until resolution starts.
+   * Declaring it readonly contradicted the method three lines below.
+   */
+  private searchPath: readonly string[];
 
   constructor(fs: FileSystem, searchPath: readonly string[]) {
     this.fs = fs;

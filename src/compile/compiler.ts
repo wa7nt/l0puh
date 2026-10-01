@@ -13,7 +13,7 @@
  */
 
 import type {
-  Binding, BinaryOp, Expr, Import, Program, Stmt, UnaryOp,
+  Binding, BinaryOp, Expr, Import, Param, Program, Stmt, UnaryOp,
 } from "../ast.ts";
 import { L0pError } from "../errors.ts";
 import {
@@ -445,7 +445,15 @@ class Compiler {
     }
   }
 
-  private stmtDef(name: string, params: readonly { name: string }[], body: readonly Stmt[], line: number): void {
+  /*
+   * `params` is `Param[]`, not a list of names.
+   *
+   * The narrower signature said `{name: string}` while `emitParamDefaults` reads
+   * each parameter's `default` -- so the type claimed the defaults were not there
+   * and the code reading them was, strictly, impossible.  Spelled as `Param` because
+   * that is what the caller passes.
+   */
+  private stmtDef(name: string, params: readonly Param[], body: readonly Stmt[], line: number): void {
     // The name is bound in the enclosing scope *before* the body is compiled, so
     // that a nested `def` can see itself and recurse.  The slot holds a cell, so
     // the closure sees the assignment that happens after the Closure op.
@@ -453,6 +461,9 @@ class Compiler {
     if (this.fn.isModule) this.globalKinds.set(name, "def");
     else slot = this.addLocal(name, "let");
 
+    // The parameter *objects*, not their names: emitParamDefaults reads each
+    // one's default.  Passing `params.map(p => p.name)` would drop it, and the
+    // default would silently never be emitted.
     this.beginFunc(name, false, params.map((p) => p.name));
     this.beginScope();
     this.emitParamDefaults(params, line);
