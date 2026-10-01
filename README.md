@@ -16,8 +16,8 @@ miscompiling them.
 
 | | |
 |---|---|
-| Tests | 388, all passing |
-| Dependencies | none |
+| Tests | 388, all passing, types checked |
+| Runtime dependencies | none; `typescript` for checking only |
 | Backend | x86-64 machine code, via clang as assembler and linker |
 
 ## Speed
@@ -53,7 +53,8 @@ node src/cli/main.ts lex FILE      # print the token stream
 node src/cli/main.ts ir FILE       # print the native intermediate representation
 node src/cli/main.ts disasm FILE   # print the compiled bytecode
 node src/cli/main.ts repl          # interactive prompt
-node --test "test/*.test.ts"       # 388 tests
+npm test                          # 388 tests, types checked
+node --test "test/*.test.ts"       # tests alone
 ```
 
 `l0p` also runs the file directly if you pass one as the first argument, and `l0p`
