@@ -594,17 +594,25 @@ describe("int and float are properties of the value", { skip: SKIP }, () => {
 /*
  * The three operators that divide.
  *
- * They are the awkward ones: x86's `idiv` raises #DE on a zero divisor and on
- * INT64_MIN / -1, and #DE is not a catchable fault -- it kills the process with
- * SIGFPE, so no code here gets the chance to report anything.  Every guard
- * therefore has to come before the instruction, and every trap has to reach the
- * runtime, which raises a proper error instead.
+ * These were inlined and are not any more, which is worth recording.
+ *
+ * `add` and `mul` inline profitably: the call they replace costs a frame and a
+ * return, and the guard costs two instructions.  Division looked the same and is
+ * not.  x86's `idiv` raises #DE on a zero divisor and on INT64_MIN / -1, and #DE
+ * is not catchable -- it ends the process with SIGFPE, so the program dies having
+ * printed nothing.  Guarding both costs four more branches, and across seven code
+ * alignments the inline version was slower in all seven: 276ms against 348ms on
+ * one `//` per iteration.  `%` alone lost as well, at 422 against 468.
+ *
+ * So the helpers keep the job.  What the attempt leaves behind is the part that
+ * has to survive either way: both traps stay handled, and only INT64_MIN / -1 is
+ * a trap -- `a / -1` is an ordinary expression and must not be guarded away.
  */
-describe("inlined division", { skip: SKIP }, () => {
-  it("truncates toward zero, like the instruction does", () => {
+describe("division, through the runtime", { skip: SKIP }, () => {
+  it("truncates toward zero, floors, and takes the sign of the dividend", () => {
     // `/` truncates, `//` floors, `%` takes the sign of the dividend.  All three
-    // differ from one another on negatives, which is where an inline path is
-    // most likely to quietly pick the wrong one.
+    // differ from one another on negatives, which is where a shortcut is most
+    // likely to pick the wrong one quietly.
     for (const e of [
       "6 / 2", "7 / 2", "-7 / 2", "7 / -2", "-7 / -2", "6 / -1", "0 / 5",
       "6 // 4", "7 // 2", "-7 // 2", "7 // -2", "-7 // -2", "-6 // 4", "6 // -4",
@@ -613,12 +621,12 @@ describe("inlined division", { skip: SKIP }, () => {
     ]) agreeOut(`print(${e})`);
   });
 
-  it("survives the pair that traps idiv", () => {
+  it("survives the one pair that traps", () => {
     /*
      * INT64_MIN / -1 is a real division with no int64 answer: the quotient is
-     * 2^63.  `idiv` raises #DE rather than returning it, and `l0p_div` widens to
-     * a double.  `INT64_MIN % -1` also traps, though the remainder is defined
-     * and is zero.  If any guard were missing the process would die with SIGFPE
+     * 2^63.  `idiv` raises #DE rather than returning it, so the helper notices
+     * and widens.  `INT64_MIN % -1` traps too, though the remainder is defined
+     * and is zero.  If either check went missing the process would take SIGFPE
      * and print nothing at all.
      */
     for (const e of [
@@ -628,36 +636,8 @@ describe("inlined division", { skip: SKIP }, () => {
     ]) agreeOut(`print(${e})`);
   });
 
-  it("checks both traps before dividing", () => {
-    const asm = compileModule(lowerProgram(parse("let x = 6\nlet y = 2\nx / y\n"), "t.l0p"));
-    const body = asm.slice(asm.indexOf("# div, inline"));
-    const zero = body.indexOf("testq %rcx, %rcx");
-    const idiv = body.indexOf("idivq %rcx");
-    // The zero test has to come first, or the instruction runs on a zero divisor.
-    assert.ok(zero !== -1 && zero < idiv, "the zero divisor test must precede idiv");
-    // So must the INT64_MIN test, which needs a register because cmpq has no
-    // 64-bit immediate -- the assembler rejects both 0x8000000000000000 and the
-    // signed literal.
-    assert.match(body, /movabsq \$-9223372036854775808, %r8/);
-    assert.ok(body.indexOf("movabsq") < idiv, "the INT64_MIN test must precede idiv");
-  });
-
-  it("falls back when the division is not exact, so `/` stays a float", () => {
-    // 7/2 is 3.5.  Truncating to 3 would be an int, and `type(7 / 2)` would stop
-    // agreeing with the interpreter; the runtime makes the float properly.
-    const asm = compileModule(lowerProgram(parse("let x = 7\nlet y = 2\nx / y\n"), "t.l0p"));
-    const body = asm.slice(asm.indexOf("# div, inline"), asm.indexOf("# div, inline") + 900);
-    assert.match(body, /testq %rdx, %rdx/, "a non-zero remainder must leave the fast path");
-  });
-
-  it("reports division by zero instead of trapping", () => {
-    /*
-     * The guards exist so that this arrives at the runtime, which prints
-     * `division by zero` and aborts.  If either guard were dropped the process
-     * would take SIGFPE and there would be no message to check -- so the test is
-     * that it exits, and says why.
-     */
-    for (const e of ["1 / 0", "1 // 0", "1 % 0", "0 / 0", "-1 / 0"]) {
+  it("reports division by zero rather than trapping", () => {
+    for (const e of ["1 / 0", "1 // 0", "1 % 0", "0 / 0", "-1 / 0", "1.0 / 0"]) {
       const built = buildNative(`print(${e})\n`, PRINTED);
       let out = "";
       let sig: string | null = null;
