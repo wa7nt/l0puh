@@ -22,23 +22,43 @@ miscompiling them.
 
 ## Speed
 
-Measured on `fib(32)`, same machine, best of five after a warm-up:
+Measured on `fib(32)` -- 28 million calls, so dominated by arithmetic -- on an
+i5-7360U:
 
 | | time | |
 |---|---|---|
-| interpreter | ~7500 ms | |
-| native | ~295 ms | **×26 faster** |
+| interpreter | ~7.2 s | |
+| native, every operation a call into C | ~250 ms | **×29 faster** |
+| native, integer arithmetic inlined | ~150 ms | **×48 faster** |
 
-A tree-walking interpreter runs roughly ×50–200 slower than compiled Go, and a
-bytecode VM around ×5–30. The native backend at ×26 is at the good end of that,
-and it is still spending nearly all of its time calling into C for arithmetic:
-every value lives in a stack slot, and every operation is a call. The register
-allocator is what closes the rest of the gap.
+Taking the call away is worth ×1.67, and that is the second row to the third.  The
+first row to the second is the backend existing at all.
 
-Numbers above 2^53 are worth a caveat. The interpreter holds numbers in a
-double and stops being exact there; the native backend has 64-bit integers and is
-right. They genuinely disagree past that point, and the native one is the one
-that is wrong to trust.
+Neither figure is exact and the spread is wide, because **code alignment alone
+moves a benchmark by 14%**.  Seven binaries, byte-identical except for one to
+eight `nop`s between the prologue and the loop, ranged from 355ms to 403ms on
+the same source.  So every number here is the mean of seven such builds:
+
+| alignment (nops) | 0 | 1 | 2 | 3 | 4 | 6 | 8 |
+|---|---|---|---|---|---|---|---|
+| calling into C | 204 | 205 | 246 | 287 | 265 | 277 | 270 |
+| inlined | 138 | 155 | 148 | 159 | 173 | 151 | 128 |
+
+The inline won in seven of seven, from ×1.32 to ×2.10, mean ×1.67.  A single
+build is worth about as much as its alignment -- which is why a number measured on
+one is only worth the noise.
+
+Inlining does not always pay.  `/`, `//` and `%` looked like the same win and
+were a 26% loss: `idiv` raises #DE on a zero divisor and on INT64_MIN / -1,
+#DE is not catchable, and guarding both costs four more branches than the call
+saves.  Measured across seven alignments, slower in seven of seven.  Those stay
+in the runtime.
+
+What is left is the rest of the gap.  Every value still lives in a 16-byte stack
+slot, so every operation still loads two slots, stores one, and cannot keep
+anything in a register.  Type inference in the IR would let the tag checks go and
+halve the slot, and a register allocator would end the loads.  Those are the two
+steps that matter, and neither is a trick.
 
 ## Running it
 
