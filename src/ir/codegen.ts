@@ -552,10 +552,26 @@ export function compileFunc(
       out.push(`  movq ${off(frame, cond) + 8}(%rbp), %rsi`);
       out.push("  callq _l0p_truthy");
       out.push("  testq %rax, %rax");
-      out.push(`  je ${label(byId(f, t.else))}`);
+      /*
+       * The false edge goes to a label *here*, not to the false block.
+       *
+       * Jumping straight at it looks equivalent and is the quietest miscompilation
+       * in this file: the branch lands in the target with none of its phi copies
+       * run, so the value that block is supposed to receive is whatever the slot
+       * held.  Nothing crashes and nothing looks wrong -- the phi destination is
+       * simply never written on that path.  A loop that exits with a name the body
+       * last set reads a stale value, and only on the edge that skipped the copy.
+       *
+       * So both edges run their own copies on the way, which is also what makes
+       * the two safe to interleave: each edge's copies read its own sources before
+       * either writes a destination.
+       */
+      const falseArm = `${label(byId(f, t.else))}_f${thisTag++}`;
+      out.push(`  je ${falseArm}`);
       out.push(...phiCopies(frame, b, byId(f, t.then)));
       out.push(`  jmp ${label(byId(f, t.then))}`);
       out.push(`  # the false edge follows the true one`);
+      out.push(`${falseArm}:`);
       out.push(...phiCopies(frame, b, byId(f, t.else)));
       out.push(`  jmp ${label(byId(f, t.else))}`);
     } else if (t.t === "ret") {

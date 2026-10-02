@@ -98,6 +98,18 @@ export type IrOp =
 export type IrBinOp = Extract<IrOp, "add" | "sub" | "mul" | "div" | "floordiv" | "mod" | "pow">;
 export type IrCmpOp = Extract<IrOp, "eq" | "ne" | "lt" | "le" | "gt" | "ge">;
 
+/**
+ * A loop-head phi that exists before the back edge that fills it is known.
+ *
+ * Not part of the IR: it is the half-open state the builder passes to itself
+ * while a loop body is being lowered, and nothing else ever sees it.
+ */
+export interface OpenPhi {
+  /** The source name, needed to find it in each predecessor's snapshot. */
+  name: string;
+  phi: Phi;
+}
+
 export interface Phi {
   dest: VReg;
   /** One entry per predecessor: which block it comes from, and from what value. */

@@ -23,7 +23,7 @@
 
 import type { Binding } from "../ast.ts";
 import { L0pError } from "../errors.ts";
-import { vreg, type Block, type Instr, type IrFunc, type IrOp, type Operand, type Phi, type Terminator, type VReg } from "./ir.ts";
+import { vreg, type Block, type Instr, type IrFunc, type IrOp, type OpenPhi, type Operand, type Phi, type Terminator, type VReg } from "./ir.ts";
 
 /** A path through the function: what each name held when it left. */
 export type Path = Map<string, VReg>;
@@ -124,6 +124,13 @@ export class FuncBuilder {
       throw new L0pError(`block b${this.current.id} already has a terminator`, 0, 0);
     }
     this.current.term = t;
+    /*
+     * What this block leaves behind is settled at its terminator, so that is
+     * when the snapshot is taken.  Recording earlier would miss the writes in
+     * the block; recording later would see whatever the *next* block bound, which
+     * is a different block's answer.
+     */
+    this.recordPath(this.current);
   }
 
   // ---------------------------------------------------------------- scopes
@@ -166,58 +173,149 @@ export class FuncBuilder {
 
   // ------------------------------------------------------------------ joins
 
+  /**
+   * A loop head's phis, opened before the body that fills them in.
+   *
+   * A head is the one place a phi must exist *before* the code that fills it: the
+   * body reads the name, and on the second pass that read has to see the value
+   * arriving from the back edge, not the one from before the loop.  Making it
+   * afterwards is too late -- every read in the body already points at the
+   * pre-loop value, which is how `i = i + 1` compiled to a `copy` nobody read,
+   * leaving the condition testing the same number forever.
+   *
+   * So each candidate name is bound to a phi carrying only the entry edge, and
+   * `closeLoopPhis` supplies the back edge afterwards.  Candidates come from a
+   * scan of the body, because a phi for every live name would be a phi for every
+   * local the loop merely reads.
+   */
+  openLoopPhis(candidates: readonly string[], entry: Block, line: number): OpenPhi[] {
+    const out: OpenPhi[] = [];
+    for (const name of candidates) {
+      const at = this.lookup(name);
+      if (at === null) continue;   // not live here: the body creates it, no merge
+      const dest = this.newReg();
+      const phi: Phi = { dest, incoming: [{ from: entry.id, value: vreg(at) }], line };
+      out.push({ name, phi });
+      // The body reads the phi, which is what makes the second pass see the
+      // back-edge value instead of the pre-loop one.
+      this.bind(name, dest);
+    }
+    return out;
+  }
+
+  /** The blocks that can flow into `merge`, read off the terminators. */
+  predecessorsOf(merge: Block): Block[] {
+    return this.blocks.filter((b) => {
+      const t = b.term;
+      if (t === null) return false;
+      if (t.t === "jump") return t.to === merge.id;
+      if (t.t === "br") return t.then === merge.id || t.else === merge.id;
+      return false;
+    });
+  }
+
+  /**
+   * Fills in the back edge and installs the phis on the head.
+   *
+   * Every predecessor of the head contributes an incoming value, not just the
+   * block the body happened to end in.  A `continue` written inside an `if` two
+   * blocks deep is its own edge into the head, and a phi with an incoming only
+   * for the body is a phi missing an arm -- which the verifier rejects outright,
+   * so the program does not compile rather than computing the wrong thing.
+   *
+   * Each value comes from that predecessor's own snapshot rather than from
+   * looking the name up now, because a name read "now" is whatever the last
+   * block lowered happened to bind, which is one path's answer and not the
+   * other's.
+   *
+   * An incoming may well be the phi's own destination, and that is correct
+   * rather than a cycle: on a back edge the value already in the phi's slot is
+   * the previous iteration's, and naming it is how a name the body never writes
+   * survives around the loop.  Guarding against that -- reading the pre-loop
+   * value instead -- quietly resets the name on every `continue`, which is a
+   * loop that counts correctly and then loses its accumulator.
+   */
+  closeLoopPhis(head: Block, open: readonly OpenPhi[]): void {
+    const preds = this.predecessorsOf(head);
+    if (preds.length < 2) return;
+    for (const o of open) {
+      const incoming: { from: number; value: Operand }[] = [];
+      let complete = true;
+      for (const p of preds) {
+        const v = this.paths.get(p.id)?.get(o.name);
+        if (v === undefined) {
+          complete = false;
+          break;
+        }
+        incoming.push({ from: p.id, value: vreg(v) });
+      }
+      if (!complete) continue;
+      o.phi.incoming = incoming;
+      head.params.push(o.phi);
+      this.phis.push({ block: head.id, phi: o.phi });
+    }
+  }
+
   /** Remembers what a block left behind, so a join can build phis from it. */
   recordPath(block: Block): void {
+    /*
+     * First write wins.  A block's bindings are final once it is terminated, so
+     * a second snapshot would capture names some later block rebound at the same
+     * scope -- giving this block's predecessors someone else's values.
+     */
+    if (this.paths.has(block.id)) return;
     this.paths.set(block.id, this.snapshot());
   }
 
   /**
-   * Creates the block two paths meet in, with a phi for every name they
-   * disagree about.
+   * The phis for a block every predecessor flows into.
    *
-   * It has to come *after* both arms are lowered, because each arm's snapshot is
-   * what says which names the two paths actually disagree on.  Creating the block
-   * first and filling it in later works too, and is what `joinParams` is for --
-   * but it splits the name in two places, so this is the one place that does it.
+   * The two-block `join` above handles an `if`.  A loop head and a loop exit do
+   * not fit that shape: a head is entered both on the first pass and on every
+   * back edge, and an exit is reached both by the condition failing and by any
+   * `break` -- so the predecessor list is however long the source made it.
+   *
+   * Reading the predecessors out of the terminators rather than being handed them
+   * is what makes that safe.  A `continue` written three blocks deep into a body
+   * adds an edge no caller was tracking, and the phi still has to be there.
    */
-  join(thenBlock: Block, elseBlock: Block, line: number): Block {
-    const join = this.newBlock("join");
-    join.params = this.makePhis(join, thenBlock, elseBlock, line);
-    return join;
-  }
-
-  /** The phis for a join, without creating the merge block.  For a statement join. */
-  joinParams(merge: Block, then: Block, other: Block, line: number): Phi[] {
-    return this.makePhis(merge, then, other, line);
-  }
-
-  private makePhis(merge: Block, then: Block, other: Block, line: number): Phi[] {
-    const a = this.paths.get(then.id);
-    const b = this.paths.get(other.id);
-    if (a === undefined || b === undefined) return [];
+  mergeParams(merge: Block, line: number): Phi[] {
+    const preds = this.blocks.filter((b) => {
+      const t = b.term;
+      if (t === null) return false;
+      if (t.t === "jump") return t.to === merge.id;
+      if (t.t === "br") return t.then === merge.id || t.else === merge.id;
+      return false;
+    });
+    if (preds.length < 2) return [];
 
     const out: Phi[] = [];
-    for (const name of [...new Set([...a.keys(), ...b.keys()])].sort()) {
-      const va = a.get(name);
-      const vb = b.get(name);
-      if (va === undefined || vb === undefined) continue;
-      // The same value on both sides: nothing to choose between, so no phi.  This
-      // is the case that matters -- copy unconditionally and every read in the
-      // code after the `if` becomes a copy.
-      if (va === vb) continue;
+    const names = [...new Set(preds.flatMap((p) => [...(this.paths.get(p.id)?.keys() ?? [])]))].sort();
+    for (const name of names) {
+      const incoming: { from: number; value: Operand }[] = [];
+      let same = true;
+      let first: VReg | undefined;
+      for (const p of preds) {
+        const v = this.paths.get(p.id)?.get(name);
+        /*
+         * A name that is not live on every path is not this merge's business.
+         * Deciding what reading it means on the path that lacks it belongs to
+         * whoever writes the source, not here.
+         */
+        if (v === undefined) {
+          incoming.length = 0;
+          break;
+        }
+        if (first === undefined) first = v;
+        else if (first !== v) same = false;
+        incoming.push({ from: p.id, value: vreg(v) });
+      }
+      if (incoming.length === 0 || same) continue;
 
       const dest = this.newReg();
-      const phi: Phi = {
-        dest,
-        incoming: [
-          { from: then.id, value: vreg(va) },
-          { from: other.id, value: vreg(vb) },
-        ],
-        line,
-      };
+      const phi: Phi = { dest, incoming, line };
       out.push(phi);
       this.phis.push({ block: merge.id, phi });
-      // After the merge, the name holds the phi.
       this.bind(name, dest);
     }
     return out;

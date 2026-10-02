@@ -18,11 +18,11 @@
  * about.
  */
 
-import { test } from "node:test";
+import { describe, it, test } from "node:test";
 import assert from "node:assert/strict";
 
 import { parse } from "../src/parser.ts";
-import { printFunc, printModule, type Block, type IrFunc } from "../src/ir/ir.ts";
+import { printFunc, printModule, type Block, type IrFunc, type Phi } from "../src/ir/ir.ts";
 import { FuncBuilder } from "../src/ir/build.ts";
 import { verifyFunc, dominators } from "../src/ir/verify.ts";
 import { lowerProgram } from "../src/ir/lower.ts";
@@ -599,4 +599,99 @@ test("an immediate null prints as null, not as a quoted string", () => {
   const text = printFunc(one("let x = null\n"));
   assert.match(text, /= const null/);
   assert.doesNotMatch(text, /"null"/);
+});
+
+/*
+ * A loop head is the one block whose phis have to exist before the code that
+ * fills them in.
+ *
+ * The head is entered on the first pass and on every back edge, so a name the
+ * body rebinds arrives with two values and needs a phi to choose.  Making the phi
+ * afterwards is too late: the condition above the body, and the reads inside it,
+ * already point at the pre-loop value.  That is not a wrong answer -- it is
+ * `i = i + 1` compiling to a `copy` nobody reads, and a loop that tests the same
+ * number forever, which is why the native backend used to hang on these.
+ *
+ * So these assert the shape rather than a number.
+ */
+describe("loop heads are merges", () => {
+  const predsOf = (f: IrFunc, id: number): number =>
+    f.blocks.filter((b) => {
+      const t = b.term;
+      if (t === null) return false;
+      if (t.t === "jump") return t.to === id;
+      if (t.t === "br") return t.then === id || t.else === id;
+      return false;
+    }).length;
+
+  it("puts a phi on a while head, with one incoming per predecessor", () => {
+    const f = named("def w(n):\n    var i = 0\n    while i < n:\n        i = i + 1\n    return i\n", "w");
+    const head = f.blocks.find((b) => b.name === "loop.head");
+    assert.ok(head !== undefined, "the loop head is missing");
+    assert.equal(predsOf(f, head.id), 2, "a while head has the entry edge and the back edge");
+    assert.equal(head.params.length, 1, "one name is written in the body, so one phi");
+    for (const p of head.params) assert.equal(p.incoming.length, predsOf(f, head.id));
+  });
+
+  it("makes the exit a merge when a break can also reach it", () => {
+    const f = named(
+      "def f(xs):\n    var i = 0\n    var out = -1\n    while i < len(xs):\n        if xs[i] < 0:\n            break\n        out = i\n        i = i + 1\n    return out\n",
+      "f",
+    );
+    const exit = f.blocks.find((b) => b.name === "loop.exit");
+    assert.ok(exit !== undefined, "the loop exit is missing");
+    assert.ok(predsOf(f, exit.id) >= 2, "the exit is reached by the test and by the break");
+    /*
+     * No phi is *required* here, and the reason is worth stating: `out` and `i`
+     * are already carried by the head's phis, and the `break` reaches the exit
+     * without writing either, so both predecessors hand over the same value and
+     * there is nothing to choose between.  A phi that joined them would be a
+     * phi choosing between two copies of one thing.
+     */
+    for (const p of exit.params) assert.equal(p.incoming.length, predsOf(f, exit.id));
+  });
+
+  it("does give the exit a phi when the break path writes something", () => {
+    // `seen` is written on the way to the break, so the two ways out disagree and
+    // the exit has to choose.  This is the case where the missing phi showed up
+    // as a stale value rather than as a missing one.
+    const f = named(
+      "def g(xs):\n    var i = 0\n    var seen = 0\n    while i < len(xs):\n        if xs[i] < 0:\n            seen = seen + 100\n            break\n        i = i + 1\n    return seen\n",
+      "g",
+    );
+    const exit = f.blocks.find((b) => b.name === "loop.exit");
+    assert.ok(exit !== undefined, "the loop exit is missing");
+    assert.ok(exit.params.length >= 1, "the break path writes `seen`, so the exit must choose");
+    const values = new Set(
+      (exit.params[0] as Phi).incoming.map((i) => (i.value.t === "vreg" ? i.value.v : -1)),
+    );
+    assert.equal(values.size, 2, "the exit phi should join two different values");
+    for (const p of exit.params) assert.equal(p.incoming.length, predsOf(f, exit.id));
+  });
+
+  it("gives a for head the phis its body needs", () => {
+    const f = named("def g(xs):\n    var acc = 0\n    for x in xs:\n        acc = acc + x\n    return acc\n", "g");
+    const head = f.blocks.find((b) => b.name === "loop.head");
+    assert.ok(head !== undefined, "the for head is missing");
+    assert.ok(head.params.length >= 1, "a name written in the body lives across iterations");
+    for (const p of head.params) assert.equal(p.incoming.length, predsOf(f, head.id));
+  });
+
+  it("never leaves a phi with one incoming, which no block has", () => {
+    // An unclosed phi is the shape this bug produced: a merge with a single edge
+    // means the loop head was entered from one place only, so it is not a merge.
+    for (const src of [
+      "def a(n):\n    var i = 0\n    while i < n:\n        i = i + 1\n    return i\n",
+      "def b(n):\n    var i = 0\n    while i < n:\n        if i > 2:\n            break\n        i = i + 1\n    return i\n",
+      "def c(xs):\n    var t = 0\n    for x in xs:\n        t = t + x\n    return t\n",
+    ]) {
+      for (const f of lower(src)) {
+        for (const b of f.blocks) {
+          for (const p of b.params) {
+            assert.ok(p.incoming.length >= 2, `phi v${p.dest} in b${b.id} has ${p.incoming.length} incoming`);
+          }
+        }
+      }
+    }
+  });
 });

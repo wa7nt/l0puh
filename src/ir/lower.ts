@@ -583,16 +583,28 @@ class Lowerer {
     b.endScope();
 
     b.setCurrent(join);
-    join.params = b.joinParams(join, thenBlock, elseBlock, line);
+    join.params = b.mergeParams(join, line);
   }
 
   private whileStmt(cond: Expr, body: readonly Stmt[], line: number): void {
     const b = this.current;
+    const entry = b.currentBlock;
     const head = b.newBlock("loop.head");
     const bodyBlock = b.newBlock("loop.body");
     const exit = b.newBlock("loop.exit");
 
     b.jump(head, line);
+
+    /*
+     * The head's phis are opened before anything is lowered into the head --
+     * the condition included, not just the body.  The condition is lowered on
+     * every pass, so a `while i < n` that read the pre-loop `i` would test the
+     * same number forever; the body reading it is the same bug one block later.
+     * Which names need a phi comes from the body, so the body is scanned first:
+     * the scan reads the source and emits nothing.
+     */
+    const open = b.openLoopPhis(assignedNames(body), entry, line);
+
     b.setCurrent(head);
     const c = this.expr(cond);
     b.branch(c, bodyBlock, exit, line);
@@ -605,7 +617,15 @@ class Lowerer {
     this.stmts(body);
     this.loops.pop();
     if (b.currentBlock.term === null) b.jump(head, line);
+    b.closeLoopPhis(head, open);
     b.endScope();
+
+    /*
+     * The exit is a merge too: the condition failing reaches it, and so does any
+     * `break`, and whatever the body last wrote has to survive into it.  Without
+     * this, a name assigned in the loop read as its pre-loop value on the way out.
+     */
+    exit.params = b.mergeParams(exit, line);
 
     b.setCurrent(exit);
   }
@@ -621,6 +641,7 @@ class Lowerer {
     const step = b.newBlock("loop.step");
     const exit = b.newBlock("loop.exit");
 
+    const entry = b.currentBlock;
     b.jump(head, line);
 
     /*
@@ -634,6 +655,11 @@ class Lowerer {
     const cursor = this.call("iter", [seq], line);
     const cursorName = `#it${this.temp++}`;
     b.bind(cursorName, asReg(cursor));
+
+    // As in a `while`: the head phis exist before anything is lowered into the
+    // head, so a name the body rebinds is read as the phi and not as the value
+    // from the previous pass.
+    const open = b.openLoopPhis(assignedNames(body), entry, line);
 
     b.setCurrent(head);
     const more = this.call("iter_more", [vreg(b.lookup(cursorName) as VReg)], line);
@@ -650,10 +676,34 @@ class Lowerer {
     this.stmts(body);
     if (b.currentBlock.term === null) b.jump(step, line);
     this.loops.pop();
+
+    /*
+     * The step block is about to hold nothing but a jump, so what it leaves
+     * behind is what the body left behind -- and that has to be recorded while
+     * the body's scope is still open.  Closing the scope first drops the very
+     * rebinding the head's phi is waiting for, and the phi then joins the
+     * pre-loop value with itself: `acc = acc + x` in a `for` loop adds to zero
+     * forever, and every `total` comes back as the first element.
+     */
+    b.recordPath(step);
     b.endScope();
 
     b.setCurrent(step);
     b.jump(head, line);
+
+    /*
+     * After the step block jumps, and not before: a `for` head's predecessors are
+     * the block that entered the loop and the step block, and a phi closed while
+     * the step still had no terminator would see one predecessor and install
+     * nothing -- leaving every read of the name pointing at a value nothing
+     * defines.  The values come from each predecessor's own snapshot, so the
+     * body scope being popped already does not matter.
+     */
+    b.closeLoopPhis(head, open);
+
+    // Same merge as a `while`: the condition failing and any `break` both land
+    // here, carrying whatever the body last wrote.
+    exit.params = b.mergeParams(exit, line);
 
     b.setCurrent(exit);
   }
@@ -713,4 +763,119 @@ function unaryName(op: UnaryOp): string {
   if (op === "+") return "pos";
   if (op === "~") return "bitnot";
   return "not";
+}
+
+/**
+ * The names a loop body may rebind, found without lowering it.
+ *
+ * A loop head needs a phi for exactly the names the body writes, and the body is
+ * what says which those are.  Scanning the source for assignment targets is a
+ * deliberate over-approximation: it can report a name the body turns out not to
+ * write on every path, which costs a phi that chooses between two copies of one
+ * value, but it cannot miss one, which would be a miscompilation.
+ *
+ * The alternative -- lowering the body twice, once to discover and once for
+ * real -- was rejected for a reason that is not about cost.  The first pass would
+ * have to be thrown away, and it would have registered every value it defined, so
+ * a second pass over a body containing a function or a struct would leave the
+ * module holding two of each.  Reading the source has no such effect.
+ *
+ * A `def` or `struct` inside the body gets no further: its assignments belong to
+ * the function or type it creates, not to the loop.
+ */
+export function assignedNames(stmts: readonly Stmt[]): string[] {
+  const out = new Set<string>();
+  const seenExpr = new Set<Expr>();
+  const seenStmt = new Set<Stmt>();
+
+  const expr = (e: Expr): void => {
+    if (seenExpr.has(e)) return;
+    seenExpr.add(e);
+    switch (e.kind) {
+      // The operands of these cannot contain an assignment, so there is nothing
+      // below them to look at.
+      case "Num": case "Bool": case "Null": case "Str": case "Ident":
+      case "Lambda":
+        /*
+         * A lambda body is its own scope.  A name it shares with the loop is not
+         * the loop's to rebind, so it is left out -- the conservative direction,
+         * since a missing phi is the failure that miscompiles.
+         */
+        return;
+      case "Spawn":
+        expr(e.call);
+        return;
+        return;
+      case "ListLit":
+        e.items.forEach(expr);
+        return;
+      case "DictLit":
+        e.entries.forEach((en) => { expr(en.key); expr(en.value); });
+        return;
+      case "Unary":
+        expr(e.operand);
+        return;
+      case "Binary": case "Logical":
+        expr(e.left); expr(e.right);
+        return;
+      case "Ternary":
+        expr(e.cond); expr(e.then); expr(e.other);
+        return;
+      case "Call":
+        expr(e.callee);
+        e.args.forEach(expr);
+        return;
+      case "Attr":
+        expr(e.obj);
+        return;
+      case "Index":
+        expr(e.obj); expr(e.index);
+        return;
+      case "Await":
+        expr(e.expr);
+        return;
+    }
+  };
+
+  const stmt = (s: Stmt): void => {
+    if (seenStmt.has(s)) return;
+    seenStmt.add(s);
+    switch (s.kind) {
+      case "ExprStmt":
+        expr(s.expr);
+        return;
+      case "Let":
+        out.add(s.name);
+        if (s.init !== null) expr(s.init);
+        return;
+      case "Assign":
+        for (const t of s.targets) if (t.kind === "Ident") out.add(t.name);
+        expr(s.value);
+        return;
+      case "If":
+        expr(s.cond);
+        s.then.forEach(stmt);
+        if (s.otherwise !== null) s.otherwise.forEach(stmt);
+        return;
+      case "While":
+        expr(s.cond);
+        s.body.forEach(stmt);
+        return;
+      case "For":
+        expr(s.iter);
+        s.body.forEach(stmt);
+        return;
+      case "Return":
+        if (s.value !== null) expr(s.value);
+        return;
+      case "Def": case "StructDef":
+        // Nothing inside belongs to the loop.
+        return;
+      case "Branch": case "Import": case "Defer":
+        return;
+    }
+  };
+
+  stmts.forEach(stmt);
+  return [...out].sort();
 }

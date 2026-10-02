@@ -653,3 +653,144 @@ describe("division, through the runtime", { skip: SKIP }, () => {
     }
   });
 });
+
+/*
+ * Loops and the names that live across an iteration.
+ *
+ * Every one of these was miscompiled before loop heads grew phis, and they fail
+ * in the way that is hardest to notice: `i = i + 1` compiled to a `copy` that
+ * nothing read, so the condition went on testing the value from before the loop.
+ * A loop that should have counted to three either returned the pre-loop value or
+ * never returned at all -- and the tests that existed passed, because not one of
+ * them assigned a `var` inside a loop and then ran the result natively.
+ */
+describe("loops carry their locals", { skip: SKIP }, () => {
+  it("counts a while loop to its bound", () => {
+    agreeOut(`
+def work(n):
+    var acc = 0
+    var i = 0
+    while i < n:
+        acc = acc + i
+        i = i + 1
+    return acc
+print(work(0), work(1), work(10))
+`);
+  });
+
+  it("reads a loop-carried name after the loop, not before it", () => {
+    // The exit is a merge too: the condition failing and a `break` both reach
+    // it, and whatever the body last wrote has to arrive there.
+    agreeOut(`
+def first(n):
+    var i = 0
+    var found = -1
+    while i < n:
+        found = i * 10
+        i = i + 1
+    return found
+print(first(0), first(1), first(5))
+`);
+  });
+
+  it("counts a for loop over its iterable", () => {
+    agreeOut(`
+def total(xs):
+    var acc = 0
+    for x in xs:
+        acc = acc + x
+    return acc
+print(total([1, 2, 3]), total([]), total([0]))
+`);
+  });
+
+  it("leaves a for loop with the last value the body wrote", () => {
+    agreeOut(`
+def last(xs):
+    var out = -1
+    for x in xs:
+        out = x
+    return out
+print(last([7, 8, 9]), last([]))
+`);
+  });
+
+  it("breaks and continues out of a loop with the value intact", () => {
+    agreeOut(`
+def firstneg(xs):
+    var i = 0
+    var seen = 0
+    while i < len(xs):
+        if xs[i] < 0:
+            seen = seen + 100
+            break
+        i = i + 1
+    return i * 1000 + seen
+print(firstneg([1, 2, -3, 4]), firstneg([1, 2, 3]))
+
+def skips(xs):
+    var acc = 0
+    var i = 0
+    while i < len(xs):
+        i = i + 1
+        if xs[i - 1] % 2 == 0:
+            continue
+        acc = acc + xs[i - 1]
+    return acc
+print(skips([1, 2, 3, 4, 5]))
+`);
+  });
+
+  it("keeps the inner loop's names out of the outer one", () => {
+    // Two loops in sequence over the same name: the second must start from the
+    // value the first left, not from whatever the first's head last held.
+    agreeOut(`
+def two():
+    var i = 0
+    var a = 0
+    while i < 3:
+        a = a + i
+        i = i + 1
+    var b = 0
+    while i < 6:
+        b = b + i
+        i = i + 1
+    return a * 100 + b
+print(two())
+`);
+  });
+
+  it("survives nested loops writing the same names", () => {
+    agreeOut(`
+def grid(n):
+    var total = 0
+    var i = 0
+    while i < n:
+        var j = 0
+        while j < n:
+            total = total + i * 10 + j
+            j = j + 1
+        i = i + 1
+    return total
+print(grid(4))
+`);
+  });
+
+  it("terminates, which is the property that was actually broken", () => {
+    // A native binary that loops forever returns nothing at all, so this is a
+    // test about the run finishing rather than about the number in it.
+    const src = `
+def count(n):
+    var i = 0
+    var seen = 0
+    while i < n:
+        seen = seen + 1
+        i = i + 1
+    return seen
+print(count(1000))
+`;
+    const built = buildNative(src, PRINTED);
+    const out = execFileSync(built.binary, { encoding: "utf8", timeout: 20000 });
+    assert.equal(out.trim(), "1000");
+  });
+});
