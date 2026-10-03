@@ -403,6 +403,22 @@ class Lowerer {
         const fb = new FuncBuilder(s.name, s.params.map(() => "param" as const));
         const saved = this.current;
         const savedSlots = this.slots;
+        /*
+         * A script's value is its last expression, and `this.last` is where that
+         * is remembered -- but an expression statement inside a function body is
+         * not a script's expression.  Left alone, a module ending in a `def` whose
+         * body ends in an expression returned the *function's* last value from the
+         * *module's* frame, where that register does not exist:
+         *
+         *     CodegenError: v5 has no slot
+         *
+         * The two are different frames with different vreg numbering, so there is
+         * no value to copy across; the module simply has no value.  Saving and
+         * clearing it around the body says so, and an expression after the `def`
+         * still becomes the script's value.
+         */
+        const savedLast = this.last;
+        this.last = null;
         this.current = fb;
         this.slots = new Map(savedSlots);
 
@@ -418,6 +434,7 @@ class Lowerer {
         const built = fb.finish(s.name, params, []);
         this.current = saved;
         this.slots = savedSlots;
+        this.last = savedLast;
 
         this.funcs.push(built);
         // A reference to the name in the module is a value, so a call through it

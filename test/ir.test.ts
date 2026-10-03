@@ -25,6 +25,7 @@ import { parse } from "../src/parser.ts";
 import { printFunc, printModule, type Block, type IrFunc, type Phi } from "../src/ir/ir.ts";
 import { FuncBuilder } from "../src/ir/build.ts";
 import { verifyFunc, dominators } from "../src/ir/verify.ts";
+import { compileModule } from "../src/ir/codegen.ts";
 import { lowerProgram } from "../src/ir/lower.ts";
 
 function lower(src: string): IrFunc[] {
@@ -693,5 +694,54 @@ describe("loop heads are merges", () => {
         }
       }
     }
+  });
+});
+
+/*
+ * A script's value is its last expression, and a function body's is not the
+ * script's.
+ *
+ * `this.last` is where the module body's last expression is remembered, and an
+ * expression statement inside a function body is not one.  Left alone, a module
+ * that ends in a `def` whose body ends in an expression returned the function's
+ * value out of the module's frame -- different frames, different vreg numbering,
+ * so the register simply did not exist there:
+ *
+ *     CodegenError: v5 has no slot
+ *
+ * A loud failure rather than a wrong answer, but it made any program whose last
+ * statement was a `def` uncompilable natively, and none of the tests noticed
+ * because every one of them ended with a `print`.
+ */
+describe("a module does not inherit a function's value", () => {
+  it("leaves the module valueless when the last statement is a def", () => {
+    const m = lowerProgram(parse("def w(n):\n    let a = 1\n    let b = 2\n    a + b\n"));
+    const module = m.funcs[0] as IrFunc;
+    const body = m.funcs[1] as IrFunc;
+    const term = module.blocks[0]?.term;
+    if (term === null || term === undefined || term.t !== "ret") {
+      throw new Error("the module needs a return terminator");
+    }
+    // Nothing to return, rather than a vreg from the other function.
+    assert.equal(term.value, null, "the module returned a value from inside `w`");
+    // And the module's own numbering cannot even name it.
+    const own = module.blocks.flatMap((b) => b.instrs).filter((i) => i.dest !== null);
+    for (const i of own) assert.ok((i.dest as number) < module.vregCount);
+    assert.ok(body.vregCount > module.vregCount, "the two frames should differ");
+  });
+
+  it("still takes the module value from an expression after a def", () => {
+    const m = lowerProgram(parse("def w(n):\n    n + 1\n7\n"));
+    const term = (m.funcs[0] as IrFunc).blocks[0]?.term;
+    if (term === null || term === undefined || term.t !== "ret") {
+      throw new Error("a trailing expression must still give the script a value");
+    }
+    assert.notEqual(term.value, null, "a trailing expression is still the script's value");
+  });
+
+  it("compiles a module whose last statement is a def", () => {
+    // The end-to-end version: this is the shape that used to be refused.
+    assert.doesNotThrow(() =>
+      compileModule(lowerProgram(parse("def w(n):\n    let a = 1\n    let b = 2\n    a + b\n"))));
   });
 });
