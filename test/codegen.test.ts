@@ -469,7 +469,7 @@ describe("inlined integer arithmetic", { skip: SKIP }, () => {
     const body = asm.slice(asm.indexOf("_l0p_fn_1:"));
     // The call still exists -- on the slow path.  What must not exist is a path
     // that *only* calls.
-    assert.match(body, /# add, inline when both operands are integers/);
+    assert.match(body, /# add, /);
     assert.match(body, /addq/);
     assert.match(body, /callq _l0p_add/);
     assert.match(body, /jne \.L/);
@@ -813,11 +813,18 @@ describe("tag tests inference has already answered", { skip: SKIP }, () => {
   const asmOf = (src: string): string =>
     compileModule(lowerProgram(parse(src), "t.l0p"));
 
+  /** How each inline site describes itself, which is what these tests count. */
+  const sites = (src: string): string[] =>
+    asmOf(src).split("\n").filter((l) => /^\s+# (add|sub|mul|lt|le|gt|ge), /.test(l)).map((l) => l.trim());
+
+  const untagged = (src: string): number =>
+    sites(src).filter((l) => l.includes("no tag test")).length;
+
   const counts = (src: string): { dropped: number; kept: number } => {
     const lines = asmOf(src).split("\n");
     return {
       dropped: lines.filter((l) => l.includes("no tag test")).length,
-      kept: lines.filter((l) => l.includes("inline when both operands")).length,
+      kept: sites(src).length - lines.filter((l) => l.includes("no tag test")).length,
     };
   };
 
@@ -875,5 +882,77 @@ print(${e})
     // what the `jo` is still there for.
     agreeOut("print(4611686018427387904 + 4611686018427387904)");
     agreeOut("print(4611686018427387904 * 4)");
+  });
+});
+
+/*
+ * Constants that never reach the stack.
+ *
+ * A literal is the one value whose tag is known before the program runs, so it is
+ * the one value that never needs a slot: `i = i + 1` was spending a 16-byte slot,
+ * a store to fill it and two loads to read it back, on the number 1.
+ *
+ * The danger is all in `cmp`.  Its operand order decides what the condition byte
+ * means -- `setl` after `cmpq %rcx, %rax` is "a < b" -- so a constant on the left
+ * does not just need a different instruction, it needs a different *answer*.
+ * `cmpq $7, %rcx` computes rcx - 7, and `setl` there would answer "b < a": a
+ * correct instruction and the wrong result.  Hence the immediate is only ever used
+ * on the right, and the reversed form keeps its operand in a register.
+ */
+describe("integer constants are immediates", { skip: SKIP }, () => {
+  const body = (src: string): string => {
+    const lines = asmOf(src).split("\n");
+    const start = lines.findIndex((l) => /# (add|sub|mul|lt|le|gt|ge), /.test(l));
+    return lines.slice(Math.max(0, start), start + 6).join("\n");
+  };
+  const asmOf = (src: string): string => compileModule(lowerProgram(parse(src), "t.l0p"));
+
+  it("puts the constant in the instruction, not in a slot", () => {
+    const b = body("def w(n):\n    let x = 1\n    x + 2\n");
+    assert.match(b, /addq \$2, %rax/);
+    assert.doesNotMatch(b, /\(%rbp\), %rcx/, "a constant must not be loaded into a register");
+  });
+
+  it("keeps the immediate form signed, or the comparison answers the wrong question", () => {
+    /*
+     * `0 < -1` is the whole test.  With the constant on the right the comparison
+     * is 0 - (-1), which is positive, so the answer is false.  Moved to the left
+     * it becomes (-1) - 0, also negative, and `setl` would report true -- which
+     * is what a plain `cmpq $a, %rcx` produces.
+     */
+    agreeOut("print(0 < -1)");
+    agreeOut("print(-1 < 0)");
+    agreeOut("print(3 < 7)");
+    agreeOut("print(7 < 3)");
+    agreeOut("print(-1 <= -1)");
+    agreeOut("print(-1 >= 0)");
+  });
+
+  it("agrees with the interpreter across sign and magnitude", () => {
+    for (const e of [
+      "5 - 3", "5 + 3", "5 * 3", "-7 - 3", "-7 + 3", "-7 * 3", "7 - -3", "-2 * -3",
+      "0 - 1", "1 - 0", "-1 - -1", "2147483647 + 1", "-2147483648 - 1",
+      "1 + 2 * 3", "(1 + 2) * 3", "10 - 3 - 2", "2 - 3 - 4",
+    ]) agreeOut(`print(${e})`);
+  });
+
+  it("leaves a fractional literal alone, since addq $2.5 does not assemble", () => {
+    // `2.5` is inside int64 and is not an integer, so a range test alone lets it
+    // through and the assembler rejects it.  The test is that the program runs.
+    agreeOut("print(1.5 + 2.5)");
+    agreeOut("print(2.0 + 2)");
+    agreeOut("print(3.5 * 2)");
+    for (const e of ["1.5 + 2.5", "3.5 * 2"]) {
+      assert.doesNotMatch(body(`def w():\n    let x = ${e.split(" ")[0]}\n    x ${e.split(" ")[1]} ${e.split(" ")[2]}\n`),
+        /addq \$2\.5|imulq \$2\.5/, "a fractional literal must not become an integer immediate");
+    }
+  });
+
+  it("still widens on overflow with both operands constant", () => {
+    // Nothing about the immediates changes the overflow rule: the sum of two
+    // int64s that leaves int64 is a float, and `jo` is what gets there.
+    agreeOut("print(4611686018427387904 + 4611686018427387904)");
+    agreeOut("print(4611686018427387904 * 4)");
+    agreeOut("print(4611686018427387904 + 4611686018427387904 == 9223372036854776000)");
   });
 });

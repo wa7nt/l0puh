@@ -16,7 +16,7 @@ miscompiling them.
 
 | | |
 |---|---|
-| Tests | 435, all passing, types checked |
+| Tests | 440, all passing, types checked |
 | Runtime dependencies | none; `typescript` for checking only |
 | Backend | x86-64 machine code, via clang as assembler and linker |
 
@@ -30,6 +30,7 @@ i5-7360U:
 | interpreter | ~7.2 s | |
 | native, every operation a call into C | ~250 ms | **×29 faster** |
 | native, integer arithmetic inlined | ~150 ms | **×48 faster** |
+| native, constants inlined as immediates | ~130 ms | **×55 faster** |
 
 Taking the call away is worth ×1.67, and that is the second row to the third.  The
 first row to the second is the backend existing at all.
@@ -73,7 +74,7 @@ node src/cli/main.ts lex FILE      # print the token stream
 node src/cli/main.ts ir FILE       # print the native intermediate representation
 node src/cli/main.ts disasm FILE   # print the compiled bytecode
 node src/cli/main.ts repl          # interactive prompt
-npm test                          # 435 tests, types checked
+npm test                          # 440 tests, types checked
 node --test "test/*.test.ts"       # tests alone
 ```
 
