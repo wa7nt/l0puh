@@ -278,6 +278,65 @@ function constantInts(f: IrFunc): Map<VReg, number> {
   return out;
 }
 
+/**
+ * Removes `copy` instructions, which the backend would otherwise pay for twice.
+ *
+ * Every `x = <expr>` inside a function becomes a fresh name bound to the result,
+ * and the `copy` that makes it is a real instruction costing two loads and two
+ * stores.  It carries no meaning: SSA already gives the result its own register,
+ * and the name it is bound to is resolved long before this point.
+ *
+ * So the copy's uses are rewritten to the value it copies and the instruction goes.
+ * That is safe because of what a `copy` is: its operand dominates it, and a
+ * `copy` is emitted where the value is being rebound, so every use of the new name
+ * is dominated by the old one.  Substituting cannot create a cycle.
+ *
+ * Run to a fixed point, since a copy of a copy is two instructions where none is
+ * needed.  The IR itself is left alone -- it is what `l0p ir` prints and what the
+ * verifier checks -- so this is a decision about how to emit, not about what the
+ * program is.
+ */
+function foldCopies(f: IrFunc): IrFunc {
+  const alias = new Map<VReg, VReg>();
+
+  for (;;) {
+    let copies = 0;
+    for (const b of f.blocks) {
+      for (const instr of b.instrs) {
+        if (instr.op !== "copy" || instr.dest === null) continue;
+        const src = instr.args[0];
+        if (src === undefined || src.t !== "vreg") continue;
+        alias.set(instr.dest, src.v);
+        copies++;
+      }
+    }
+    if (copies === 0) break;
+    for (const b of f.blocks) b.instrs = b.instrs.filter((i) => !(i.op === "copy" && i.dest !== null && alias.has(i.dest)));
+    for (const b of f.blocks) {
+      for (const instr of b.instrs) instr.args = instr.args.map(sub);
+      for (const phi of b.params) {
+        phi.incoming = phi.incoming.map((inc) => ({ ...inc, value: sub(inc.value) }));
+      }
+      const t = b.term;
+      if (t === null) continue;
+      if (t.t === "br") t.cond = sub(t.cond);
+      else if (t.t === "ret" && t.value !== null) t.value = sub(t.value);
+    }
+  }
+
+  function sub(op: Operand): Operand {
+    let v = op;
+    // The chain is short -- a handful of rebindings at most -- but following it
+    // rather than assuming one step is what makes a second round unnecessary.
+    for (let guard = 0; guard < 64 && v.t === "vreg" && alias.has(v.v); guard++) {
+      v = { t: "vreg", v: alias.get(v.v) as VReg };
+    }
+    return v;
+  }
+
+  return f;
+}
+
 /** The largest value `addq $K, %rax` accepts without a `movabsq` first. */
 function fitsImm32(v: number): boolean {
   return v >= -2147483648 && v <= 2147483647;
@@ -594,12 +653,13 @@ function byId(f: IrFunc, id: number): Block {
 
 /** Compile one function. */
 export function compileFunc(
-  f: IrFunc,
+  fIn: IrFunc,
   symbol: string,
   globals: Map<string, number> = new Map(),
   strings: Map<string, number> = new Map(),
 ): string {
   const out: string[] = [];
+  const f = foldCopies(fIn);
   const frame = layoutFrame(f, globals, strings);
   const label = (b: Block): string => `.L${symbol}_b${b.id}`;
   // A source name can contain anything; a label cannot.  `<module>` in a label is

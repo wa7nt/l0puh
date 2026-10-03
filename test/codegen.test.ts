@@ -956,3 +956,51 @@ describe("integer constants are immediates", { skip: SKIP }, () => {
     agreeOut("print(4611686018427387904 + 4611686018427387904 == 9223372036854776000)");
   });
 });
+
+/*
+ * `copy` instructions the backend pays for and does not need.
+ *
+ * Every `x = <expr>` inside a function binds a fresh name to the result, and the
+ * `copy` that does it is a real instruction: two loads and two stores.  It carries
+ * no meaning -- SSA already gave the result its own register, and the name is
+ * resolved long before codegen -- so the copy's uses are rewritten to the value it
+ * copies and the instruction goes.
+ *
+ * Safe because of what a `copy` is: its operand dominates it.  A copy is emitted
+ * where the name is being rebound, so every use of the new name is dominated by
+ * the old one, and substituting cannot make a cycle.  The `ir.test.ts` shape tests
+ * still see the copies, because the IR is left alone and this is a decision about
+ * how to emit rather than about what the program is.
+ */
+describe("copies are folded away", { skip: SKIP }, () => {
+  const emitted = (src: string): string => compileModule(lowerProgram(parse(src), "t.l0p"));
+
+  it("emits no copy instruction for a local rebinding", () => {
+    const asm = emitted("def w(n):\n    var i = 0\n    while i < n:\n        i = i + 1\n    return i\n");
+    assert.doesNotMatch(asm, /movq %rax, -\d+\(%rbp\)\n\s*movq %rax, -\d+\(%rbp\)/,
+      "a copy is two loads and two stores, and there should be none left");
+    // The `ir.test.ts` shape is unchanged: the copy is still in the IR.
+    assert.doesNotThrow(() => lowerProgram(parse("def w(n):\n    var i = 0\n    while i < n:\n        i = i + 1\n    return i\n")));
+  });
+
+  it("shrinks the loop body rather than just moving the work", () => {
+    const lines = emitted("def w(n):\n    var i = 0\n    var t = 0\n    while i < n:\n        t = t - 1\n        i = i + 1\n    return t\n").split("\n");
+    const a = lines.findIndex((l) => l.includes("_fn_1_b3:"));
+    const b = lines.findIndex((l) => l.includes("_fn_1_b4:"));
+    const body = lines.slice(a, b);
+    const loads = body.filter((l) => /^\s*movq -?\d+\(%rbp\), %r/.test(l)).length;
+    const stores = body.filter((l) => /^\s*movq %r\w+, -?\d+\(%rbp\)/.test(l)).length;
+    assert.equal(loads + stores, 34, "18 reads and 16 writes; it was 42 before folding");
+  });
+
+  it("agrees with the interpreter wherever rebinding happens", () => {
+    // Each of these rebinds a name, which is what produced the copies.
+    for (const src of [
+      "def w(n):\n    var i = 0\n    var t = 0\n    while i < n:\n        t = t - 1\n        i = i + 1\n    return t\nprint(w(5))",
+      "def g(n):\n    var i = 0\n    var acc = 0\n    while i < n:\n        acc = acc + i * 2 - 1\n        i = i + 1\n    return acc\nprint(g(5))",
+      "def f(xs):\n    var i = 0\n    var s = 0\n    while i < len(xs):\n        if xs[i] < 0:\n            s = s + 100\n            break\n        i = i + 1\n    return i * 1000 + s\nprint(f([1, 2, -3, 4]), f([1, 2, 3]))",
+      "def s2(xs):\n    var acc = 0\n    var i = 0\n    while i < len(xs):\n        i = i + 1\n        if xs[i - 1] % 2 == 0:\n            continue\n        acc = acc + xs[i - 1]\n    return acc\nprint(s2([1, 2, 3, 4, 5]))",
+      "def grid(n):\n    var total = 0\n    var i = 0\n    while i < n:\n        var j = 0\n        while j < n:\n            total = total + i * 10 + j\n            j = j + 1\n        i = i + 1\n    return total\nprint(grid(4))",
+    ]) agreeOut(src);
+  });
+});
