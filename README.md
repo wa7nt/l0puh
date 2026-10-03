@@ -16,7 +16,7 @@ miscompiling them.
 
 | | |
 |---|---|
-| Tests | 427, all passing, types checked |
+| Tests | 435, all passing, types checked |
 | Runtime dependencies | none; `typescript` for checking only |
 | Backend | x86-64 machine code, via clang as assembler and linker |
 
@@ -73,7 +73,7 @@ node src/cli/main.ts lex FILE      # print the token stream
 node src/cli/main.ts ir FILE       # print the native intermediate representation
 node src/cli/main.ts disasm FILE   # print the compiled bytecode
 node src/cli/main.ts repl          # interactive prompt
-npm test                          # 427 tests, types checked
+npm test                          # 435 tests, types checked
 node --test "test/*.test.ts"       # tests alone
 ```
 

@@ -30,6 +30,7 @@
  */
 
 import type { Block, Instr, IrFunc, IrModule, Operand, Phi, VReg } from "../ir/ir.ts";
+import { inferTypes, type Ty } from "../ir/types.ts";
 
 /** A value is 16 bytes: a tag and a payload. */
 const VALUE_BYTES = 16;
@@ -230,6 +231,7 @@ function doubleBits(x: number): bigint {
 function emitInlineInt(
   frame: Frame,
   i: Instr,
+  types: readonly Ty[],
   helper: string,
   /**
    * The arithmetic, with `%rax` holding the left payload and `%rcx` the right on
@@ -249,13 +251,31 @@ function emitInlineInt(
   const slow = `.L${helper}_slow${n}`;
   const done = `.L${helper}_done${n}`;
 
-  out.push(`  # ${i.op}, inline when both operands are integers`);
-  out.push(`  movq ${off(frame, a.v) + 8}(%rbp), %rax`);
-  out.push(`  cmpq $${TAG.INT}, ${off(frame, a.v)}(%rbp)`);
-  out.push(`  jne ${slow}`);
-  out.push(`  movq ${off(frame, b.v) + 8}(%rbp), %rcx`);
-  out.push(`  cmpq $${TAG.INT}, ${off(frame, b.v)}(%rbp)`);
-  out.push(`  jne ${slow}`);
+  /*
+     * Two instructions per operand are spent asking what the tags are, and where
+     * inference has already answered the question they are dead.  Both operands
+     * being provably int64 is the only case that qualifies: one int and one float
+     * takes a different path in the runtime, so "one of them is an int" buys
+     * nothing here.
+     *
+     * What does *not* go is the overflow branch the caller emits.  Knowing both
+     * inputs fit int64 says nothing about the result, which is exactly why `jo` is
+     * there; dropping it alongside these would turn a widened float into a wrapped
+     * negative number that is a perfectly plausible int64.
+     */
+    const knownInt = types[a.v] === "int" && types[b.v] === "int";
+  
+    out.push(`  # ${i.op}, ${knownInt ? "both operands known to be int64, so no tag test" : "inline when both operands are integers"}`);
+    out.push(`  movq ${off(frame, a.v) + 8}(%rbp), %rax`);
+    if (!knownInt) {
+      out.push(`  cmpq $${TAG.INT}, ${off(frame, a.v)}(%rbp)`);
+      out.push(`  jne ${slow}`);
+    }
+    out.push(`  movq ${off(frame, b.v) + 8}(%rbp), %rcx`);
+    if (!knownInt) {
+      out.push(`  cmpq $${TAG.INT}, ${off(frame, b.v)}(%rbp)`);
+      out.push(`  jne ${slow}`);
+    }
   for (const line of compute(slow)) out.push(`  ${line}`);
   out.push(`  movq $${TAG.INT}, ${off(frame, d)}(%rbp)`);
   out.push(`  movq %rax, ${off(frame, d) + 8}(%rbp)`);
@@ -276,6 +296,7 @@ function emitInlineInt(
 function emitInlineCompare(
   frame: Frame,
   i: Instr,
+  types: readonly Ty[],
   helper: string,
   /** `setae`, `seta`, `setg`, `setl`: an unsigned-style condition byte write. */
   set: string,
@@ -293,13 +314,31 @@ function emitInlineCompare(
   const slow = `.L${helper}_slow${n}`;
   const done = `.L${helper}_done${n}`;
 
-  out.push(`  # ${i.op}, inline when both operands are integers`);
-  out.push(`  movq ${off(frame, a.v) + 8}(%rbp), %rax`);
-  out.push(`  cmpq $${TAG.INT}, ${off(frame, a.v)}(%rbp)`);
-  out.push(`  jne ${slow}`);
-  out.push(`  movq ${off(frame, b.v) + 8}(%rbp), %rcx`);
-  out.push(`  cmpq $${TAG.INT}, ${off(frame, b.v)}(%rbp)`);
-  out.push(`  jne ${slow}`);
+  /*
+     * Two instructions per operand are spent asking what the tags are, and where
+     * inference has already answered the question they are dead.  Both operands
+     * being provably int64 is the only case that qualifies: one int and one float
+     * takes a different path in the runtime, so "one of them is an int" buys
+     * nothing here.
+     *
+     * What does *not* go is the overflow branch the caller emits.  Knowing both
+     * inputs fit int64 says nothing about the result, which is exactly why `jo` is
+     * there; dropping it alongside these would turn a widened float into a wrapped
+     * negative number that is a perfectly plausible int64.
+     */
+    const knownInt = types[a.v] === "int" && types[b.v] === "int";
+  
+    out.push(`  # ${i.op}, ${knownInt ? "both operands known to be int64, so no tag test" : "inline when both operands are integers"}`);
+    out.push(`  movq ${off(frame, a.v) + 8}(%rbp), %rax`);
+    if (!knownInt) {
+      out.push(`  cmpq $${TAG.INT}, ${off(frame, a.v)}(%rbp)`);
+      out.push(`  jne ${slow}`);
+    }
+    out.push(`  movq ${off(frame, b.v) + 8}(%rbp), %rcx`);
+    if (!knownInt) {
+      out.push(`  cmpq $${TAG.INT}, ${off(frame, b.v)}(%rbp)`);
+      out.push(`  jne ${slow}`);
+    }
   // `cmp` sets the flags for `a` against `b`; the condition byte is what the
   // caller asked for.  Signed and unsigned differ only in the prefix.
   if (signed) out.push(`  cmpq %rcx, %rax`);
@@ -513,6 +552,20 @@ export function compileFunc(
     out.push(`  movq %rax, ${off(frame, p) + 8}(%rbp)`);
   });
 
+  /*
+   * What the compiler knows before it emits anything.
+   *
+   * Used only to drop tests that cannot fail, so this is not a shortcut past a
+   * check: the alternative is the same check at run time.  If the inference were
+   * unsound the symptom would be a wrong answer rather than a refusal, which is
+   * why `types.ts` is conservative by construction and by test.
+   *
+   * The win is small and measured rather than assumed.  `+` never narrows to int,
+   * so most real arithmetic keeps its tag tests; only `sub` and the comparisons
+   * against literals lose them, and a loop written with `+` gets nothing.
+   */
+  const types = inferTypes(f);
+
   for (const b of f.blocks) {
     out.push(`${label(b)}:`);
     /*
@@ -523,7 +576,7 @@ export function compileFunc(
      * was written in turn, and the last one would win regardless of how control
      * got here.
      */
-    for (const i of b.instrs) out.push(...instr(frame, i));
+    for (const i of b.instrs) out.push(...instr(frame, i, types));
     const t = b.term;
     if (t === null) {
       out.push("  # no terminator; the verifier should have caught this");
@@ -687,7 +740,7 @@ function needVreg(o: Operand): VReg {
   return o.v;
 }
 
-function instr(frame: Frame, i: Instr): string[] {
+function instr(frame: Frame, i: Instr, types: readonly Ty[]): string[] {
   const out: string[] = [];
   const d = i.dest;
 
@@ -1018,7 +1071,7 @@ function instr(frame: Frame, i: Instr): string[] {
     }
 
     case "add":
-      return emitInlineInt(frame, i, "l0p_add", (slow) => [
+      return emitInlineInt(frame, i, types, "l0p_add", (slow) => [
         "movq %rcx, %rdx",
         "addq %rdx, %rax",
         // Overflow leaves int64, so the runtime's widening rule applies.  One
@@ -1028,29 +1081,29 @@ function instr(frame: Frame, i: Instr): string[] {
 
     case "sub":
       // Subtraction of two int64s cannot overflow.
-      return emitInlineInt(frame, i, "l0p_sub", () => [
+      return emitInlineInt(frame, i, types, "l0p_sub", () => [
         "movq %rcx, %rdx",
         "subq %rdx, %rax",
       ]);
 
     case "mul":
-      return emitInlineInt(frame, i, "l0p_mul", (slow) => [
+      return emitInlineInt(frame, i, types, "l0p_mul", (slow) => [
         "imulq %rcx, %rax",
         // IMUL sets OF when the product does not fit in the destination.
         `jo ${slow}`,
       ]);
 
     case "lt":
-      return emitInlineCompare(frame, i, "l0p_lt", "setl", true);
+      return emitInlineCompare(frame, i, types, "l0p_lt", "setl", true);
 
     case "le":
-      return emitInlineCompare(frame, i, "l0p_le", "setle", true);
+      return emitInlineCompare(frame, i, types, "l0p_le", "setle", true);
 
     case "gt":
-      return emitInlineCompare(frame, i, "l0p_gt", "setg", true);
+      return emitInlineCompare(frame, i, types, "l0p_gt", "setg", true);
 
     case "ge":
-      return emitInlineCompare(frame, i, "l0p_ge", "setge", true);
+      return emitInlineCompare(frame, i, types, "l0p_ge", "setge", true);
 
     default: {
       const h = HELPERS[i.op];

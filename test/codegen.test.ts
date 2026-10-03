@@ -794,3 +794,86 @@ print(count(1000))
     assert.equal(out.trim(), "1000");
   });
 });
+
+/*
+ * Tag tests the compiler can prove cannot fail.
+ *
+ * Inference answers "is this an int64" before anything is emitted, and where it
+ * says yes the two `cmpq` per operand are dead.  The saving is small and was
+ * measured rather than assumed: 4% on a loop where every operation narrows, 7%
+ * on a realistic one, and nothing at all on a loop written with `+`, because `+`
+ * never narrows -- the sum of two int64s can leave int64 and the runtime widens
+ * it to a float.
+ *
+ * So what these tests mostly check is that the elision happens where it may and
+ * *nowhere else*.  A dropped check that was load-bearing is a wrong answer, not a
+ * crash, which is the failure mode this project cannot have.
+ */
+describe("tag tests inference has already answered", { skip: SKIP }, () => {
+  const asmOf = (src: string): string =>
+    compileModule(lowerProgram(parse(src), "t.l0p"));
+
+  const counts = (src: string): { dropped: number; kept: number } => {
+    const lines = asmOf(src).split("\n");
+    return {
+      dropped: lines.filter((l) => l.includes("no tag test")).length,
+      kept: lines.filter((l) => l.includes("inline when both operands")).length,
+    };
+  };
+
+  it("drops the test for a subtraction of two known int64s", () => {
+    // `sub` is the operator that can stay int: two int64s always have an int64
+    // difference, so the counter is an int at the head and stays one round the
+    // loop.
+    const c = counts("def w(n):\n    var i = 0\n    while i < n:\n        i = i - 1\n    return i\n");
+    assert.equal(c.dropped, 1, "the subtraction should not test tags");
+  });
+
+  it("keeps the test for an addition, which can leave int64", () => {
+    // The same loop with `+`.  `add(int, int)` is `num`, not `int`, because the
+    // sum that overflows becomes a float -- so the operands are only known to be
+    // numbers and the runtime still has to decide which path to take.
+    const c = counts("def w(n):\n    var i = 0\n    while i < n:\n        i = i + 1\n    return i\n");
+    assert.equal(c.dropped, 0, "`+` must not be treated as an int operation");
+    assert.equal(c.kept, 2, "the comparison against n and the addition both keep their tests");
+  });
+
+  it("keeps the test when either operand is a parameter", () => {
+    // Nothing is known about what a caller passed.
+    const c = counts("def w(n):\n    return n - 1\n");
+    assert.equal(c.dropped, 0);
+  });
+
+  it("keeps the overflow branch even with the tag test gone", () => {
+    /*
+     * This is the one that matters most.  Dropping the tag test says the operands
+     * fit int64; it says nothing about the result.  An `add` or `mul` whose result
+     * leaves int64 must still branch to the runtime, or a widened float becomes a
+     * wrapped negative number that is a perfectly plausible int64.
+     */
+    const lines = asmOf("def w(n):\n    let a = 1\n    let b = 2\n    a + b\n    a * b\n    a - b\n")
+      .split("\n");
+    const dropped = lines.filter((l) => l.includes("no tag test"));
+    assert.ok(dropped.length > 0, "these operands are all literals, so the tests should go");
+    // add and mul both keep `jo`; sub never had one and cannot overflow.
+    assert.equal((lines.join("\n").match(/jo \.L/g) ?? []).length, 2,
+      "add and mul must keep their overflow branch after the tag test is gone");
+  });
+
+  it("still agrees with the interpreter, including on overflow", () => {
+    for (const e of ["work(10)", "work(1)"]) agreeOut(`
+def work(n):
+    var i = 0
+    var t = 0
+    while i < n:
+        t = t - 1
+        i = i + 1
+    return t
+print(${e})
+`);
+    // Two int64s whose sum leaves int64: the result must be a float, which is
+    // what the `jo` is still there for.
+    agreeOut("print(4611686018427387904 + 4611686018427387904)");
+    agreeOut("print(4611686018427387904 * 4)");
+  });
+});
