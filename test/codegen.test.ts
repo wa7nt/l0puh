@@ -1004,3 +1004,74 @@ describe("copies are folded away", { skip: SKIP }, () => {
     ]) agreeOut(src);
   });
 });
+
+/*
+ * A built-in named in the source is a known function.
+ *
+ * It was being called as if it were not, and the cost was two calls plus a heap
+ * allocation per execution:
+ *
+ *     l0p_builtin(name)   a linear scan of the table with a strcmp per entry,
+ *                         then arena_zalloc of a 64-byte L0pFn
+ *     l0p_fn_call(fn)    three tag checks and an indirect call, to reach a
+ *                         function whose address was a constant all along
+ *
+ * The allocation is why this was fatal and not merely slow.  The arena has a
+ * fixed size and `l0p_arena_reset` is declared but never called, so a `for` loop
+ * spent 128 bytes of arena per element forever.  A loop of 20 million elements --
+ * a perfectly ordinary program -- died with "out of arena" on every alignment,
+ * and only survived at all because the earlier benchmark was ten times smaller.
+ *
+ * So these check the shape of the call, and that a loop which used to be fatal
+ * now finishes.
+ */
+describe("built-ins are called directly", { skip: SKIP }, () => {
+  const asmOf = (src: string): string => compileModule(lowerProgram(parse(src), "t.l0p"));
+
+  it("calls the built-in's own symbol, not the name lookup", () => {
+    const asm = asmOf('def w(s):\n    return len(s)\n');
+    assert.match(asm, /callq _l0p_bi_len/);
+    assert.doesNotMatch(asm, /callq _l0p_builtin/, "the strcmp scan should be gone");
+    assert.doesNotMatch(asm, /callq _l0p_fn_call/, "the trampoline should be gone");
+    // And nothing needs the name in the data section any more.
+    assert.doesNotMatch(asm, /Lbn_len/, "a known name needs no string table entry");
+  });
+
+  it("passes the built-in's arguments in its own ABI", () => {
+    const asm = asmOf("def w(xs):\n    var i = 0\n    var n = 0\n    while i < len(xs):\n        i = i + 1\n    return n\n");
+    // (uint64_t argc, const L0pValue *argv, void *env), so argc in %rdi, the
+    // array in %rsi, and the environment -- NULL, since a built-in captures
+    // nothing -- in %rdx.
+    assert.match(asm, /movq \$\d+, %rdi\n\s*leaq [-\d]+\(%rbp\), %rsi\n\s*xorl %edx, %edx\n\s*callq _l0p_bi_len/);
+  });
+
+  it("keeps every built-in correct", () => {
+    for (const src of [
+      'print(len("abc"))', "print(len([1, 2, 3]))", 'print(str(42))', 'print(int("7"))',
+      "print(int(3.9))", "print(float(3))", "print(bool(0))", 'print(bool("x"))',
+      "print(type(1), type(1.5), type(1.5 + 0.0), type(null))",
+      'print(len([]), len(""))', "print(len([1, 2]) + len(\"abc\"))",
+    ]) agreeOut(src);
+  });
+
+  it("runs a loop that used to exhaust the arena", () => {
+    /*
+     * 2 million element visits: about 256 MB of arena through the old path, which
+     * is past the limit, so this program did not merely run slowly -- it aborted.
+     */
+    const src = `
+def work(xs, n):
+    var total = 0
+    var k = 0
+    while k < n:
+        for x in xs:
+            total = total + x
+        k = k + 1
+    return total
+print(work([1, 2, 3, 4], 500000))
+`;
+    const built = buildNative(src, PRINTED);
+    const out = execFileSync(built.binary, { encoding: "utf8", timeout: 120000 });
+    assert.equal(out.trim(), "5000000");
+  });
+});

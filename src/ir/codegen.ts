@@ -38,8 +38,19 @@ const VALUE_BYTES = 16;
 /** x86-64 integer argument registers, in order.  There are six. */
 const INT_ARG_REGS = ["%rdi", "%rsi", "%rdx", "%rcx", "%r8", "%r9"] as const;
 
-/** The tag constants the code generator needs to build a value. */
-const TAG = { NULL: 0, FALSE: 1, TRUE: 2, INT: 3, FLOAT: 4 } as const;
+/**
+ * The tag constants the code generator needs.
+ *
+ * These mirror `enum l0p_tag` in rt/l0p_rt.h, and the ones that are only *read*
+ * rather than built are here for inline forms that test a tag: truthiness of a
+ * list, the length of a string.  A wrong constant there inverts a condition
+ * rather than failing to assemble, so the test that checks the runtime's enum
+ * against this table is not optional bookkeeping.
+ */
+const TAG = {
+  NULL: 0, FALSE: 1, TRUE: 2, INT: 3, FLOAT: 4,
+  STR: 5, LIST: 6, DICT: 7, STRUCT: 8, FN: 9, UPVAL: 10, MODULE: 11, ITER: 12,
+} as const;
 
 export class CodegenError extends Error {
   readonly line: number;
@@ -543,6 +554,28 @@ function emitFieldName(label: string, name: string): string[] {
 }
 
 /** The name of a built-in, as a C string for `l0p_builtin`. */
+/**
+ * The C entry point of each built-in, keyed by the name the source uses.
+ *
+ * Only these ten, and the table is the same one the runtime dispatches on -- a
+ * built-in reachable by another route keeps going through `l0p_builtin`, which
+ * is what makes this an optimisation and not a second definition of what a
+ * built-in is.  Every signature here is the runtime's native ABI:
+ * `(uint64_t argc, const L0pValue *argv, void *env)`.
+ */
+const BUILTIN_SYMBOL: Record<string, string> = {
+  print: "l0p_bi_print",
+  len: "l0p_bi_len",
+  str: "l0p_bi_str",
+  int: "l0p_bi_int",
+  float: "l0p_bi_float",
+  bool: "l0p_bi_bool",
+  type: "l0p_bi_type",
+  iter: "l0p_bi_iter",
+  iter_more: "l0p_bi_iter_more",
+  iter_next: "l0p_bi_iter_next",
+};
+
 function emitBuiltinName(name: string, unique: string): string[] {
   return [
     "  .section __TEXT,__const",
@@ -550,6 +583,71 @@ function emitBuiltinName(name: string, unique: string): string[] {
     `  .asciz "${escapeAsm(name)}"`,
     "  .text",
   ];
+}
+
+/**
+ * Truth, inline, where the type makes it decidable.
+ *
+ * `l0p_truthy` is a call, and it is called on every `if`, every `while`, every
+ * ternary and every `and`/`or` -- so it is on the path of every loop in a program.
+ * For some types the rules are in the tag and for others the payload decides:
+ *
+ *     bool    the tag is TRUE or FALSE, so one compare settles it
+ *     int     false when the payload is zero, but only once the tag says INT
+ *     list    false when empty, and the length is the first word of the object
+ *     str     the same, through a different tag
+ *
+ * Anything else keeps the call.  A wrong guess here inverts a condition without
+ * any other symptom, so each inline form still checks the tag it relies on and
+ * hands every other case to the runtime.
+ *
+ * **Every form ends with `testq %rax, %rax`,** and that is not tidiness.  The
+ * caller branches on ZF, and each form above leaves ZF describing whatever it
+ * last compared -- the tag, say, which is zero precisely when the value is
+ * *true*.  Without the normalisation `if true:` takes the false edge, because
+ * `cmpq $2, 2` leaves ZF set.  Computing the answer in a register does not touch
+ * the flags; something has to set them.
+ */
+function emitTruthy(frame: Frame, v: VReg, types: readonly Ty[], slow: string, at: string): string[] {
+  const t = types[v];
+  const settle = ["  # the caller branches on ZF, so it has to describe the answer", "  testq %rax, %rax"];
+  if (t === "bool") {
+    return [
+      "  # truthy: known bool, so the tag decides",
+      `  cmpq $${TAG.TRUE}, ${off(frame, v)}(%rbp)`,
+      `  jne ${slow}`,
+      "  movq $1, %rax",
+      ...settle,
+    ];
+  }
+  if (t === "int") {
+    return [
+      "  # truthy: known int, so the tag and then a zero test",
+      `  cmpq $${TAG.INT}, ${off(frame, v)}(%rbp)`,
+      `  jne ${slow}`,
+      `  movq ${off(frame, v) + 8}(%rbp), %rax`,
+      "  testq %rax, %rax",
+      "  setne %al",
+      "  movzbq %al, %rax",
+      ...settle,
+    ];
+  }
+  // Both object layouts begin with a length, so emptiness is one load.
+  if (t === "list" || t === "str") {
+    const tag = t === "list" ? TAG.LIST : TAG.STR;
+    return [
+      `  # truthy: known ${t}, so its length decides`,
+      `  cmpq $${tag}, ${off(frame, v)}(%rbp)`,
+      `  jne ${slow}`,
+      `  movq ${off(frame, v) + 8}(%rbp), %rax`,
+      "  movq (%rax), %rax",
+      "  testq %rax, %rax",
+      "  setne %al",
+      "  movzbq %al, %rax",
+      ...settle,
+    ];
+  }
+  return [];
 }
 
 /**
@@ -761,10 +859,22 @@ export function compileFunc(
        * operation costs anyway.
        */
       const cond = needVreg(t.cond);
-      out.push(`  movq ${off(frame, cond)}(%rbp), %rdi`);
-      out.push(`  movq ${off(frame, cond) + 8}(%rbp), %rsi`);
-      out.push("  callq _l0p_truthy");
-      out.push("  testq %rax, %rax");
+      /*
+       * The condition is tested inline when its type settles the answer, and
+       * through the runtime otherwise.  The label is the one the false edge needs
+       * in any case, so naming it here costs nothing and keeps both readers of
+       * this branch looking at the same place.
+       */
+      const falseArm = `${label(byId(f, t.else))}_f${thisTag++}`;
+      const inline = emitTruthy(frame, cond, types, falseArm, falseArm);
+      if (inline.length > 0) {
+        for (const line of inline) out.push(line);
+      } else {
+        out.push(`  movq ${off(frame, cond)}(%rbp), %rdi`);
+        out.push(`  movq ${off(frame, cond) + 8}(%rbp), %rsi`);
+        out.push("  callq _l0p_truthy");
+        out.push("  testq %rax, %rax");
+      }
       /*
        * The false edge goes to a label *here*, not to the false block.
        *
@@ -779,7 +889,6 @@ export function compileFunc(
        * the two safe to interleave: each edge's copies read its own sources before
        * either writes a destination.
        */
-      const falseArm = `${label(byId(f, t.else))}_f${thisTag++}`;
       out.push(`  je ${falseArm}`);
       out.push(...phiCopies(frame, b, byId(f, t.then)));
       out.push(`  jmp ${label(byId(f, t.then))}`);
@@ -1182,6 +1291,38 @@ function instr(frame: Frame, i: Instr, types: readonly Ty[], consts: Map<VReg, n
         throw new CodegenError(`not a built-in name: ${name}`, i.line);
       }
       out.push(...spillArgs(frame, i.args, i.line));
+
+      /*
+       * A built-in named in the source is a known function, and it was being
+       * called as if it were not.
+       *
+       * The old shape was two calls plus a heap allocation for *every* call site
+       * execution:
+       *
+       *     l0p_builtin(name)   linear scan of the table, strcmp per entry,
+       *                         then arena_zalloc of a 64-byte L0pFn -- which is
+       *                         how a `for` loop came to spend 128 bytes of arena
+       *                         per element, in an arena nothing ever resets
+       *     l0p_fn_call(fn)    three tag checks and an indirect call, to reach a
+       *                         function whose address was known all along
+       *
+       * The name is a literal in the instruction, so the address is a constant.
+       * What remains is the call itself, in the built-in's own ABI: argc in the
+       * first integer register, the argument array in the second, the closure
+       * environment in the third -- which is NULL here, since a built-in has no
+       * upvalues to capture.
+       */
+      const direct = BUILTIN_SYMBOL[name];
+      if (direct !== undefined) {
+        out.push(`  movq $${i.args.length}, %rdi`);
+        out.push(`  leaq ${argvBase(frame, 0)}(%rbp), %rsi`);
+        out.push("  xorl %edx, %edx");
+        out.push(`  callq _${direct}`);
+        out.push(`  movq %rax, ${off(frame, d)}(%rbp)`);
+        out.push(`  movq %rdx, ${off(frame, d) + 8}(%rbp)`);
+        return out;
+      }
+
       /*
        * The label carries a counter as well as the name, because the same built-in
        * can be called from a dozen places and a repeated label is an assembler
