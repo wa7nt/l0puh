@@ -108,6 +108,15 @@ export interface OpenPhi {
   /** The source name, needed to find it in each predecessor's snapshot. */
   name: string;
   phi: Phi;
+  /**
+   * What the name held when the phi was opened.
+   *
+   * `openLoopPhis` binds the name to the phi immediately, because the body has
+   * to read it.  If the phi then turns out not to belong -- the head has one
+   * predecessor, so there is nothing to choose between -- the name has to go back
+   * to this, or it is left pointing at a value nothing defines.
+   */
+  entryValue: VReg;
 }
 
 export interface Phi {

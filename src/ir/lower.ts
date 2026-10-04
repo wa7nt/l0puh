@@ -634,8 +634,15 @@ class Lowerer {
     this.stmts(body);
     this.loops.pop();
     if (b.currentBlock.term === null) b.jump(head, line);
-    b.closeLoopPhis(head, open);
+    /*
+     * After the body scope closes, not before.  A candidate that turns out not to
+     * need a phi puts the name back, and a name bound while the body scope is
+     * still open would be discarded by `endScope` -- leaving the phantom again.
+     * The values themselves come from each predecessor's snapshot, so the scope
+     * being gone does not matter.
+     */
     b.endScope();
+    b.closeLoopPhis(head, open);
 
     /*
      * The exit is a merge too: the condition failing reaches it, and so does any

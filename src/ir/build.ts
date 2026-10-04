@@ -195,7 +195,7 @@ export class FuncBuilder {
       if (at === null) continue;   // not live here: the body creates it, no merge
       const dest = this.newReg();
       const phi: Phi = { dest, incoming: [{ from: entry.id, value: vreg(at) }], line };
-      out.push({ name, phi });
+      out.push({ name, phi, entryValue: at });
       // The body reads the phi, which is what makes the second pass see the
       // back-edge value instead of the pre-loop one.
       this.bind(name, dest);
@@ -237,19 +237,45 @@ export class FuncBuilder {
    */
   closeLoopPhis(head: Block, open: readonly OpenPhi[]): void {
     const preds = this.predecessorsOf(head);
-    if (preds.length < 2) return;
     for (const o of open) {
       const incoming: { from: number; value: Operand }[] = [];
-      let complete = true;
+      let usable = preds.length >= 2;
       for (const p of preds) {
         const v = this.paths.get(p.id)?.get(o.name);
         if (v === undefined) {
-          complete = false;
+          usable = false;
           break;
         }
         incoming.push({ from: p.id, value: vreg(v) });
       }
-      if (!complete) continue;
+      /*
+       * Not every candidate becomes a phi.
+       *
+       * A loop whose body always leaves -- every path a `break` -- sends nothing
+       * back to the head, so the head has one predecessor and there is nothing to
+       * choose between.  The name is not bound back to its old value here, because
+       * the body has already been lowered reading the phi: restoring the binding
+       * now would leave those reads pointing at a value nothing defines.
+       *
+       *     while x:
+       *         k = k + 1
+       *         break
+       *
+       * So the destination is defined by a copy instead, which is what the phi
+       * would have amounted to: the value enters from one place and comes out
+       * unchanged.  A phi with a single incoming arm would be the same thing
+       * wearing a disguise, and the verifier is right to refuse those.
+       */
+      if (!usable) {
+        head.instrs.push({
+          op: "copy",
+          dest: o.phi.dest,
+          args: [vreg(o.entryValue)],
+          info: null,
+          line: o.phi.line,
+        });
+        continue;
+      }
       o.phi.incoming = incoming;
       head.params.push(o.phi);
       this.phis.push({ block: head.id, phi: o.phi });
